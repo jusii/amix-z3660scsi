@@ -1,0 +1,9 @@
+hdf/
+*.hdf
+repo/
+work/
+tmp/
+build/
+core
+*~
+.DS_Store

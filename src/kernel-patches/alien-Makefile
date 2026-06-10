@@ -1,0 +1,10 @@
+.c.o:
+	$(CC) -c -O $(CFLAGS) -I../.. -I../inc $<
+
+OBJ	= ct.o dd.o a2090.o a2091.o a3091.o a4091.o z3660.o sd.o sdpart.o physdsk.o scsi.o
+
+exp:	$(OBJ) Makefile
+	ld -r -o exp $(OBJ)
+
+clean:
+	-rm -f $(OBJ) exp
