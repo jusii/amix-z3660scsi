@@ -5,10 +5,16 @@
  * mailbox protocol, ported to the Z3660's Zynq ARM (open source: shanshe/Z3660,
  * z3660-drivers/scsi/z3660_scsi.c).  There is no 53C710, no SCRIPTS, no DSA, no
  * SCSI bus phases and no interrupt/poll completion: it is a tiny synchronous MMIO
- * register mailbox.  The Z3660 SCSI is a real AutoConfig board (manuf 0x144B,
- * product 0x01), so it appears in bootinfo.autocon[] and is mapped with sptalloc()
- * exactly like the A4091 (the board sits in Zorro III space; sptalloc is TT-gap
- * safe regardless of whether it lands in the 0x40000000 gap or the TT1 range).
+ * register mailbox.  The piscsi registers ride the Z3660's combined RTG+SCSI
+ * window: with autoconfig_rtg YES it is a Zorro III AutoConfig board (manuf
+ * 0x144B, product 0x01) and KS places it high (0x40000000+); with autoconfig_rtg
+ * NO (the usual config) the very same window sits at a FIXED 0x10000000 and is
+ * never autoconfigured at all.  On Amix 2.1 the bootinfo autocon table is also
+ * unreliable on real metal (see grimoire-amix: hydra detection).  So detection
+ * is multi-method, like the Hydra driver: try autocon() first, then -- only on
+ * an AGA machine (VPOSR >= 0x22; the ECS build box must never touch it) -- probe
+ * the fixed base directly and verify the mailbox answers (DRVTYPE reads 0/1).
+ * Mapping uses sptalloc() exactly like the A4091 (TT-gap safe).
  *
  * Protocol (board_base-relative, all 32-bit MMIO):
  *   register window  = board_base + 0x2000  (commands written/read as longs at
@@ -50,9 +56,11 @@
 #include	"sd.h"
 
 #define	Z3660_PROD	0x144B0001	/* autocon pc = (manufacturer<<16)|product */
+#define	Z3660_FIXED	0x10000000	/* combo window base when not autoconfigured */
+#define	VPOSR		0xDFF004	/* Agnus/Alice id: bits 8-14 >= 0x22 -> AGA */
 #define	PISCSI_OFFSET	0x00002000	/* register window within the board */
 #define	BOUNCE_OFFSET	0x00080000	/* bounce buffer within the board */
-#define	BOUNCE_PAGES	16		/* 64KB bounce (PISCSI_MAX_BLOCK_SIZE) */
+#define	BOUNCE_PAGES	32		/* 64KB bounce; Amix NBPP is 2KB, not 4KB! */
 #define	MAXXFER		65536		/* max bytes per piscsi op */
 #define	BOUNCE_THRESH	0x08000000	/* buffers below this are bounced by the ARM */
 
@@ -101,21 +109,34 @@ ulong	z3660_lastblock, z3660_lastlen, z3660_blocks0, z3660_dma;
 uchar	z3660_rc, z3660_lastcmd, z3660_present;
 
 /*
- * Map the register window and the bounce buffer into kernel VA.
- * 0 on success; ENXIO when no Z3660 is present (Amiberry / non-Z3660 host).
+ * Map the register window and the bounce buffer into kernel VA and verify the
+ * mailbox answers.  0 on success; ENXIO when no Z3660 is present.
+ *
+ * Detection is multi-method (hydra-style): bootinfo's autocon table first;
+ * when that misses (table unreliable on 2.1, or the board is outside the
+ * autoconfig chain at the fixed base) probe Z3660_FIXED directly -- but only
+ * on AGA, so the ECS build box (no Z3660, open bus at 0x10000000) never goes
+ * there.  Breadcrumbs: a write to the read-only P_BLOCKS register makes the
+ * ARM print "WARN: Write to read only register" with the value -- a free
+ * 68k->serial debug channel on real hardware, a no-op everywhere else.
  */
+#define	BREADCRUMB(v)	WRLONG( P_BLOCKS, (ulong)(v))
+
 static int
 z3660map()
 {
 	long	base, size;
+	ulong	t;
 
 	if (regs)
 		return 0;
 	unless (autocon( Z3660_PROD, 0, &base, &size)) {
-		z3660_present = 0;
-		return ENXIO;			/* no Z3660 in this machine */
+		if ((((*(volatile ushort *)VPOSR) >> 8) & 0x7F) < 0x22) {
+			z3660_present = 0;
+			return ENXIO;	/* ECS/OCS machine -- no Z3660 here */
+		}
+		base = Z3660_FIXED;	/* AGA: probe the fixed combo window */
 	}
-	z3660_present = 1;
 	board_phys = base;
 	regs   = (volatile uchar *)sptalloc( 1, PG_V,
 			phystopfn( (paddr_t)base + PISCSI_OFFSET), 0);
@@ -125,7 +146,34 @@ z3660map()
 		regs = 0;
 		return ENOMEM;
 	}
+	BREADCRUMB( 0xB00B0001);		/* mapped; about to probe */
+	BREADCRUMB( board_phys);
+	WRLONG( P_DRVNUMX, 6);
+	t = RDLONG( P_DRVTYPE);			/* firmware: 0 or 1, nothing else */
+	BREADCRUMB( 0xB00B0002);
+	BREADCRUMB( t);
+	if (t > 1) {
+		regs = 0;			/* open bus / not a piscsi window */
+		z3660_present = 0;
+		return ENXIO;
+	}
+	z3660_present = 1;
 	return 0;
+}
+
+/*
+ * sd.c probe hook (see templates/sd.c.in @DRIVER_PROBES@): register the card
+ * even when autocon() knows nothing about it.  Returns 1 and the board base
+ * when the mailbox is alive.
+ */
+int
+z3660present( ap)
+char	**ap;
+{
+	if (z3660map())
+		return 0;
+	*ap = (char *)board_phys;
+	return 1;
 }
 
 static ulong
@@ -206,11 +254,17 @@ struct sdcom	*cp;
 	ulong	block, blocks, bs, nb;
 	uchar	*data;
 	uchar	op;
+	static int	firstq;
 
 	if (e = z3660map()) {
 		cp->status = 0xff; cp->okay = FALSE;
 		(*cp->intr)( cp);
 		return TRUE;
+	}
+	if (firstq == 0) {
+		firstq = 1;
+		BREADCRUMB( 0xB00B0003);	/* first command reached the driver */
+		BREADCRUMB( cp->cdb[0]);
 	}
 
 	unit = (int)cp->unit;
@@ -299,7 +353,9 @@ struct sdcom	*cp;
 		z3660_lastlen   = blocks * bs;
 		nb = z3660_nblocks( unit);
 		z3660_blocks0 = nb;
-		if (blocks == 0 || (nb != 0 && (block + blocks) > nb)) {
+		/* nb == 0 means the firmware has no drive mapped at this unit --
+		 * it would silently no-op the I/O and we must NOT report GOOD. */
+		if (blocks == 0 || nb == 0 || (block + blocks) > nb) {
 			cp->status = 0xff; cp->okay = FALSE;
 			break;
 		}
