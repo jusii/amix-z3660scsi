@@ -101,6 +101,7 @@ extern int	timeout();
 static volatile uchar	*regs;		/* board+0x2000 register window  */
 static volatile uchar	*bounce;	/* board+0x80000 bounce buffer   */
 static long		board_phys;
+static void		z3660beat();
 
 #define	WRLONG(cmd,val)	(*(volatile ulong *)(regs + (cmd)) = (ulong)(val))
 #define	RDLONG(cmd)	(*(volatile ulong *)(regs + (cmd)))
@@ -159,7 +160,32 @@ z3660map()
 		return ENXIO;
 	}
 	z3660_present = 1;
+	timeout( z3660beat, (caddr_t)0, 100);	/* start liveness heartbeat */
 	return 0;
+}
+
+/*
+ * Cross-file breadcrumb + liveness heartbeat (TRACE build).  z3660_crumb is
+ * called from dd.c/physdsk.c instrumentation; a no-op until the board maps
+ * (and forever on the build box).  The heartbeat proves clock/timeout
+ * machinery is still alive after a freeze.
+ */
+void
+z3660_crumb( v)
+ulong	v;
+{
+	if (regs)
+		BREADCRUMB( v);
+}
+
+static ulong	z3660_beatn;
+
+static void
+z3660beat()
+{
+	z3660_crumb( 0xB00BBEA7);
+	z3660_crumb( ++z3660_beatn);
+	timeout( z3660beat, (caddr_t)0, 100);
 }
 
 /*
@@ -253,7 +279,9 @@ static void
 z3660done( cp)
 struct sdcom	*cp;
 {
+	BREADCRUMB( 0xB00BD0E0 | (cp->okay ? 1 : 0));
 	(*cp->intr)( cp);
+	BREADCRUMB( 0xB00BD0EE);
 }
 
 /*
