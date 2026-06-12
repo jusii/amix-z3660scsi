@@ -154,3 +154,44 @@ The protocol is trivial to emulate — it's exactly the shape Amiberry/WinUAE al
 - `repo/KNOWN_ISSUES.md` (DMA-not-in-EMU, SCSI-SD-emulation bug history).
 - The A4091-on-Amix predecessor project (`../amix-a4091/`) — framework, build env, gotchas, clean-gate.
 - `a2065.cpp` (WinUAE/Amiberry) — the AutoConfig-board + MMIO-bank emulation model.
+
+## Real-hardware findings (2026-06-12 overnight session)
+
+First contact with the physical A4000+Z3660. Everything below verified against the
+**deployed firmware fork** (`~/Devel/Omat/Amiga/Z3660`, branch `amix-boot`) and live boots.
+
+- **Board identity:** the piscsi window rides the combined RTG+SCSI window. Autoconfig
+  products under manuf 0x144B: Z2 RTG+SCSI combo = **product 0x03** (advertises 64KB),
+  Z3 fast RAM = 0x02, **Z3 RTG+piscsi = 0x01** (the ID our driver and the upstream AmigaOS
+  driver probe). With `autoconfig_rtg NO` (normal config) the combo window never enters the
+  autoconfig chain at all — it sits at a **fixed 0x10000000** (EMU decode in
+  cpu_emulator.cpp; boot serial prints "[Core1] Autoconfig RTG to 0x1000").
+- **Z2 variant is unusable for Amix piscsi:** base 0xE90000 + bounce offset 0x80000 =
+  0xF10000, which the EMU decodes as extended-ROM space *before* the SCSI-window branch
+  (ext kickstart loads at 0xF00000). All Amix RAM is motherboard fast at 0x07xxxxxx
+  (< 0x08000000), so the firmware *always* bounces — the Z2 path can never move data.
+- **Detection reality (the silent-hang root cause):** Amix 2.1's bootinfo autocon table
+  missed the board both with `autoconfig_rtg NO` (expected — fixed base, not in chain) and
+  with `YES` (KS configures it at 0x40000000 but the table still misses it — matches the
+  grimoire hydra finding that the 2.1 table is unreliable on real metal). Since the
+  generated sd.c only registered cards via autocon(), z3660queue never ran: kernel banner,
+  then silence — no panic, no I/O. Fix: multi-method detect (autocon → AGA-gated probe of
+  0x10000000, DRVTYPE must read 0/1) + sd.c `probe=` fallback hook (driver.conf field).
+- **Free 68k→serial debug channel:** writes to read-only P_BLOCKS (0x10) make the ARM print
+  "WARN: Write to read only register …(addr: value)" unconditionally → BREADCRUMB() macro.
+  DRVTYPE reads return strictly 0/1 (safe presence probe); **never read P_BLOCKS0+unit×4 of
+  an unmapped drive** — the ARM divides by block_size 0 (Zynq div-by-zero).
+- **The old "Amix boots then hangs" on the real box was NOT this driver:** that kernel
+  (banner "2.1", no AGA gate) booted via the firmware's WD33C93/A3000 emulation at
+  0xDD0000 ([WCMD] = WD Select-and-Transfer traces) and wedged deterministically ~2.5 min
+  after kernel entry in a completion re-entrancy race (ihandle→iodone→chunk-resubmit double
+  startio → self-linked sdcom → buffer-pool starvation). Full analysis: recon workflow
+  2026-06-12; instrumented firmware source preserved as commit 87db04b on `amix-boot`.
+- **Boot timing (UAE_030_MMU, 667 MHz):** power-on → +1 s SD init → +8 s PISCSI maps →
+  +30 s "JIT disabled" → **banner ≈ +120 s**. Old kernel reached root I/O ≈ banner+0–30 s.
+  Give up: no banner by 3 min, or no progress 6 min after banner.
+- **Deploy loop:** TFTP via ARM console ('C' spam on serial at power-on, then 'P'; path
+  toggle SPACE is one-way 0:→1:): 900 MB ≈ 28 min at ~550 KB/s. HDF must be raw (the
+  golden VHD is `conectix`/VHD format — convert with qemu-img, RDSK lands at block 2,
+  firmware "No RDB found" for Amix images is normal/harmless). Always clean-shutdown the
+  Amix guest before grabbing an HDF Amiberry has mounted.
