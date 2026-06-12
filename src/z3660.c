@@ -96,6 +96,7 @@ extern int	autocon();
 extern caddr_t	sptalloc();
 extern void	bcopy();
 extern int	printf();
+extern int	timeout();
 
 static volatile uchar	*regs;		/* board+0x2000 register window  */
 static volatile uchar	*bounce;	/* board+0x80000 bounce buffer   */
@@ -241,6 +242,21 @@ uchar	*data;
 }
 
 /*
+ * Deferred completion: the piscsi op itself is synchronous, but calling
+ * cp->intr inline from inside the sdqueue/ddstrategy call chain recurses
+ * dd.c's ihandle->iodone->b_iodone->ddstrategy loop one kernel stack frame
+ * per chunk (stack death on the first big multi-chunk burst -- observed on
+ * real HW at the cylinder-group write burst ~100 I/Os into boot).  Complete
+ * from clock context via timeout() instead, like a real interrupt HBA.
+ */
+static void
+z3660done( cp)
+struct sdcom	*cp;
+{
+	(*cp->intr)( cp);
+}
+
+/*
  * Generic SCSI queue entry -- mirrors a4091queue()/a3091queue().  Interprets the
  * CDB from cp->cdb (the piscsi firmware only does block I/O + geometry, so the
  * non-data commands are synthesised here, as in z3660_scsi.c:piscsi_scsi()).
@@ -258,7 +274,7 @@ struct sdcom	*cp;
 
 	if (e = z3660map()) {
 		cp->status = 0xff; cp->okay = FALSE;
-		(*cp->intr)( cp);
+		timeout( z3660done, (caddr_t)cp, 1);
 		return TRUE;
 	}
 	if (firstq == 0) {
@@ -266,6 +282,8 @@ struct sdcom	*cp;
 		BREADCRUMB( 0xB00B0003);	/* first command reached the driver */
 		BREADCRUMB( cp->cdb[0]);
 	}
+	/* TRACE build: every command, op in low byte */
+	BREADCRUMB( 0xB00B0F00 | cp->cdb[0]);
 
 	unit = (int)cp->unit;
 	data = (uchar *)cp->addr;
@@ -356,10 +374,22 @@ struct sdcom	*cp;
 		/* nb == 0 means the firmware has no drive mapped at this unit --
 		 * it would silently no-op the I/O and we must NOT report GOOD. */
 		if (blocks == 0 || nb == 0 || (block + blocks) > nb) {
+			BREADCRUMB( 0xB00B0BAD);	/* TRACE: rejected */
+			BREADCRUMB( block);
+			BREADCRUMB( blocks);
+			BREADCRUMB( nb);
 			cp->status = 0xff; cp->okay = FALSE;
 			break;
 		}
+		BREADCRUMB( 0xB00B0010 | (ulong)write);	/* TRACE: rw issue */
+		BREADCRUMB( block);
+		BREADCRUMB( blocks);
 		z3660_rw( unit, write, block, blocks, bs, data);
+		if (write == 0 && data) {
+			BREADCRUMB( 0xB00B0011);	/* TRACE: read result */
+			BREADCRUMB( *(ulong *)data);	/* first long received */
+			BREADCRUMB( z3660_dma);		/* USED_DMA seen */
+		}
 		break;
 
 	default:
@@ -368,7 +398,7 @@ struct sdcom	*cp;
 	}
 
 	z3660_rc = cp->okay ? 0 : 0xff;
-	(*cp->intr)( cp);
+	timeout( z3660done, (caddr_t)cp, 1);
 	return TRUE;
 }
 
