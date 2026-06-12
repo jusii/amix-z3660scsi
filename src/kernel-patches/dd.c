@@ -150,7 +150,8 @@ struct buf	*bp;
 	{ extern void z3660_crumb();
 	  z3660_crumb( 0xB00BDD00);
 	  z3660_crumb( bp->b_blkno);
-	  z3660_crumb( bp->b_flags); }
+	  z3660_crumb( bp->b_flags);
+	  z3660_crumb( (ulong)bp); }
 	bp->av_forw = 0;
 	bp->b_resid = 0;
 	dp = &ddtab[sdcard( bp->b_edev)][sdunit( bp->b_edev)];
@@ -197,7 +198,8 @@ struct sdcom	*cp;
 
 	{ extern void z3660_crumb();
 	  z3660_crumb( 0xB00BDD01);
-	  z3660_crumb( cp->status); }
+	  z3660_crumb( cp->status);
+	  z3660_crumb( (ulong)ddtab[cp->card][cp->unit].bhead); }
 	dp = &ddtab[cp->card][cp->unit];
 	bp = dp->bhead;
 	if (not cp->okay)

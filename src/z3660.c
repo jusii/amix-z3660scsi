@@ -50,8 +50,10 @@
  *       repo/KNOWN_ISSUES.md, ../amix-a4091/src/a4091-wr.c (Amix framework).
  */
 #include	"sys/types.h"
+#include	"sys/param.h"		/* USIZE etc. for proc.h */
 #include	"sys/immu.h"		/* PG_V, phystopfn, paddr_t */
 #include	"sys/errno.h"
+#include	"sys/proc.h"		/* TRACE: sleep-channel dump */
 #include	"rico.h"
 #include	"sd.h"
 
@@ -180,11 +182,26 @@ ulong	v;
 
 static ulong	z3660_beatn;
 
+extern struct proc	*practive;	/* active process chain (SVR4) */
+
 static void
 z3660beat()
 {
 	z3660_crumb( 0xB00BBEA7);
 	z3660_crumb( ++z3660_beatn);
+	if ((z3660_beatn % 2) == 0) {		/* every ~4s: all procs, stat+wchan */
+		struct proc	*p;
+		for (p = practive; p; p = p->p_next) {
+			z3660_crumb( 0xB00BC000 | ((ulong)p->p_pid & 0xFFF));
+			z3660_crumb( ((ulong)p->p_stat << 28)
+				   | ((ulong)p->p_wchan & 0x0FFFFFFF));
+			if (p->p_stat == SZOMB) {	/* why did it die? */
+				z3660_crumb( 0xB00BDEAD);
+				z3660_crumb( ((ulong)p->p_wcode << 24)
+					   | ((ulong)p->p_wdata & 0xFFFFFF));
+			}
+		}
+	}
 	timeout( z3660beat, (caddr_t)0, 100);
 }
 
