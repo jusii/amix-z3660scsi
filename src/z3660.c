@@ -50,10 +50,8 @@
  *       repo/KNOWN_ISSUES.md, ../amix-a4091/src/a4091-wr.c (Amix framework).
  */
 #include	"sys/types.h"
-#include	"sys/param.h"		/* USIZE etc. for proc.h */
 #include	"sys/immu.h"		/* PG_V, phystopfn, paddr_t */
 #include	"sys/errno.h"
-#include	"sys/proc.h"		/* TRACE: sleep-channel dump */
 #include	"rico.h"
 #include	"sd.h"
 
@@ -103,7 +101,6 @@ extern int	timeout();
 static volatile uchar	*regs;		/* board+0x2000 register window  */
 static volatile uchar	*bounce;	/* board+0x80000 bounce buffer   */
 static long		board_phys;
-static void		z3660beat();
 
 #define	WRLONG(cmd,val)	(*(volatile ulong *)(regs + (cmd)) = (ulong)(val))
 #define	RDLONG(cmd)	(*(volatile ulong *)(regs + (cmd)))
@@ -120,12 +117,9 @@ uchar	z3660_rc, z3660_lastcmd, z3660_present;
  * when that misses (table unreliable on 2.1, or the board is outside the
  * autoconfig chain at the fixed base) probe Z3660_FIXED directly -- but only
  * on AGA, so the ECS build box (no Z3660, open bus at 0x10000000) never goes
- * there.  Breadcrumbs: a write to the read-only P_BLOCKS register makes the
- * ARM print "WARN: Write to read only register" with the value -- a free
- * 68k->serial debug channel on real hardware, a no-op everywhere else.
+ * there.  The mailbox is then verified by reading DRVTYPE (the firmware returns
+ * only 0 or 1; anything else means open bus / not a piscsi window).
  */
-#define	BREADCRUMB(v)	WRLONG( P_BLOCKS, (ulong)(v))
-
 static int
 z3660map()
 {
@@ -150,59 +144,15 @@ z3660map()
 		regs = 0;
 		return ENOMEM;
 	}
-	BREADCRUMB( 0xB00B0001);		/* mapped; about to probe */
-	BREADCRUMB( board_phys);
 	WRLONG( P_DRVNUMX, 6);
-	t = RDLONG( P_DRVTYPE);			/* firmware: 0 or 1, nothing else */
-	BREADCRUMB( 0xB00B0002);
-	BREADCRUMB( t);
+	t = RDLONG( P_DRVTYPE);			/* firmware returns 0 or 1 only */
 	if (t > 1) {
 		regs = 0;			/* open bus / not a piscsi window */
 		z3660_present = 0;
 		return ENXIO;
 	}
 	z3660_present = 1;
-	timeout( z3660beat, (caddr_t)0, 100);	/* start liveness heartbeat */
 	return 0;
-}
-
-/*
- * Cross-file breadcrumb + liveness heartbeat (TRACE build).  z3660_crumb is
- * called from dd.c/physdsk.c instrumentation; a no-op until the board maps
- * (and forever on the build box).  The heartbeat proves clock/timeout
- * machinery is still alive after a freeze.
- */
-void
-z3660_crumb( v)
-ulong	v;
-{
-	if (regs)
-		BREADCRUMB( v);
-}
-
-static ulong	z3660_beatn;
-
-extern struct proc	*practive;	/* active process chain (SVR4) */
-
-static void
-z3660beat()
-{
-	z3660_crumb( 0xB00BBEA7);
-	z3660_crumb( ++z3660_beatn);
-	if ((z3660_beatn % 2) == 0) {		/* every ~4s: all procs, stat+wchan */
-		struct proc	*p;
-		for (p = practive; p; p = p->p_next) {
-			z3660_crumb( 0xB00BC000 | ((ulong)p->p_pid & 0xFFF));
-			z3660_crumb( ((ulong)p->p_stat << 28)
-				   | ((ulong)p->p_wchan & 0x0FFFFFFF));
-			if (p->p_stat == SZOMB) {	/* why did it die? */
-				z3660_crumb( 0xB00BDEAD);
-				z3660_crumb( ((ulong)p->p_wcode << 24)
-					   | ((ulong)p->p_wdata & 0xFFFFFF));
-			}
-		}
-	}
-	timeout( z3660beat, (caddr_t)0, 100);
 }
 
 /*
@@ -292,26 +242,11 @@ uchar	*data;
  * real HW at the cylinder-group write burst ~100 I/Os into boot).  Complete
  * from clock context via timeout() instead, like a real interrupt HBA.
  */
-/*
- * PFLUSHA executed from a data array (no inline asm under the K&R cc).
- * EXPERIMENT (real-HW): the EMU core's targeted PFLUSH after PTE updates may
- * be ineffective (stale ATC -> freshly paged-in text executes as garbage ->
- * init dies SIGILL at _rt_boot).  Flushing the whole ATC after every read
- * completion papers over that class of bug; if boot proceeds, the stale-ATC
- * diagnosis is confirmed.  Caches are not emulated in UAE_030_MMU mode, so
- * executing from .data is safe here.
- */
-static ushort	z3660_pflusha_ops[] = { 0xF000, 0x2400, 0x4E75 }; /* pflusha; rts */
-
 static void
 z3660done( cp)
 struct sdcom	*cp;
 {
-	BREADCRUMB( 0xB00BD0E0 | (cp->okay ? 1 : 0));
-	if (cp->reading)
-		(* (void (*)()) z3660_pflusha_ops)();
 	(*cp->intr)( cp);
-	BREADCRUMB( 0xB00BD0EE);
 }
 
 /*
@@ -328,20 +263,12 @@ struct sdcom	*cp;
 	ulong	block, blocks, bs, nb;
 	uchar	*data;
 	uchar	op;
-	static int	firstq;
 
 	if (e = z3660map()) {
 		cp->status = 0xff; cp->okay = FALSE;
 		timeout( z3660done, (caddr_t)cp, 1);
 		return TRUE;
 	}
-	if (firstq == 0) {
-		firstq = 1;
-		BREADCRUMB( 0xB00B0003);	/* first command reached the driver */
-		BREADCRUMB( cp->cdb[0]);
-	}
-	/* TRACE build: every command, op in low byte */
-	BREADCRUMB( 0xB00B0F00 | cp->cdb[0]);
 
 	unit = (int)cp->unit;
 	data = (uchar *)cp->addr;
@@ -432,22 +359,10 @@ struct sdcom	*cp;
 		/* nb == 0 means the firmware has no drive mapped at this unit --
 		 * it would silently no-op the I/O and we must NOT report GOOD. */
 		if (blocks == 0 || nb == 0 || (block + blocks) > nb) {
-			BREADCRUMB( 0xB00B0BAD);	/* TRACE: rejected */
-			BREADCRUMB( block);
-			BREADCRUMB( blocks);
-			BREADCRUMB( nb);
 			cp->status = 0xff; cp->okay = FALSE;
 			break;
 		}
-		BREADCRUMB( 0xB00B0010 | (ulong)write);	/* TRACE: rw issue */
-		BREADCRUMB( block);
-		BREADCRUMB( blocks);
 		z3660_rw( unit, write, block, blocks, bs, data);
-		if (write == 0 && data) {
-			BREADCRUMB( 0xB00B0011);	/* TRACE: read result */
-			BREADCRUMB( *(ulong *)data);	/* first long received */
-			BREADCRUMB( z3660_dma);		/* USED_DMA seen */
-		}
 		break;
 
 	default:
