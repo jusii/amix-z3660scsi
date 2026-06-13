@@ -292,11 +292,24 @@ uchar	*data;
  * real HW at the cylinder-group write burst ~100 I/Os into boot).  Complete
  * from clock context via timeout() instead, like a real interrupt HBA.
  */
+/*
+ * PFLUSHA executed from a data array (no inline asm under the K&R cc).
+ * EXPERIMENT (real-HW): the EMU core's targeted PFLUSH after PTE updates may
+ * be ineffective (stale ATC -> freshly paged-in text executes as garbage ->
+ * init dies SIGILL at _rt_boot).  Flushing the whole ATC after every read
+ * completion papers over that class of bug; if boot proceeds, the stale-ATC
+ * diagnosis is confirmed.  Caches are not emulated in UAE_030_MMU mode, so
+ * executing from .data is safe here.
+ */
+static ushort	z3660_pflusha_ops[] = { 0xF000, 0x2400, 0x4E75 }; /* pflusha; rts */
+
 static void
 z3660done( cp)
 struct sdcom	*cp;
 {
 	BREADCRUMB( 0xB00BD0E0 | (cp->okay ? 1 : 0));
+	if (cp->reading)
+		(* (void (*)()) z3660_pflusha_ops)();
 	(*cp->intr)( cp);
 	BREADCRUMB( 0xB00BD0EE);
 }
