@@ -195,3 +195,47 @@ First contact with the physical A4000+Z3660. Everything below verified against t
   golden VHD is `conectix`/VHD format — convert with qemu-img, RDSK lands at block 2,
   firmware "No RDB found" for Amix images is normal/harmless). Always clean-shutdown the
   Amix guest before grabbing an HDF Amiberry has mounted.
+
+## Overnight session 2026-06-12/13: the banner-hang root cause is the EMU core, not SCSI
+
+Eight build-deploy-observe cycles on the real A4000+Z3660 (full log: tmp/serial-powercycle.log,
+crumb decode in the iteration commits). Chronology of findings:
+
+1. **The z3660 piscsi driver WORKS on real hardware.** Multi-method detect engages the fixed
+   0x10000000 base, DRVTYPE answers, and the driver carried the whole boot I/O load: ~100+
+   reads/writes per boot, every transfer byte-correct (page-in first-longs match /sbin/init and
+   libc.so.1 file content exactly), every completion clean. It also faithfully wrote init's core
+   dump — the mysterious "final write burst" of every hang.
+2. **The hang is init dying.** Proc-table heartbeat dump: pid 1 goes SONPROC → SSLEEP on the
+   pageio chunk buf (0x400B1400 — the old kernel's "STUCKBUF") → **SZOMB with p_wcode=CLD_DUMPED,
+   p_wdata=SIGILL**. With init dead, boot silently stops after the banner; kernel daemons idle
+   normally (heartbeat + scheduler alive). The old WD33C93-path kernel died the same way — its
+   "SCSI wedge" was post-mortem noise.
+3. **The SIGILL is an EMU-core demand-paging bug.** Core dump analysis (adb + capstone): fault
+   PC = libc.so.1 `_rt_boot+0x0` (vaddr 0xC100F348, libc text mapped at 0xC1000000 per the core's
+   segment table) — the dynamic-linker bootstrap entry, i.e. the FIRST instruction executed from
+   a freshly demand-paged text page. File bytes there are a legal `movea.l a7,a0`. The EMU
+   executed something else.
+4. **Not stale-ATC-for-lack-of-flushing:** a PFLUSHA executed after every read completion
+   (driver-side experiment) does not save init. Together with (3) this converges on
+   `UAE_030_MMU_plan.md` Risk #3 / decision #3's predicted failure: **faulted-instruction
+   restart** — the ifetch that page-faulted resumes without re-fetching the now-present page.
+   The fork's own WIP re-fault detector (87db04b, cpummu030.cpp) was circling the same area.
+5. **dd.c latent bug found & fixed on the way** (real, just not the root cause): ihandle ran
+   iodone() before its trailing startio; iodone's b_iodone chunk-resubmit re-enters ddstrategy
+   synchronously → double-issued &dp->com (async drivers) or unbounded recursion (synchronous
+   drivers). Fixed (issue-next-then-iodone) + z3660 completions deferred via timeout() — both
+   verified booting in Amiberry.
+
+**Firmware fix domain:** ~/Devel/Omat/Amiga/Z3660 branch amix-boot, cpummu030.cpp /
+m68k_run_mmu030 ifetch-fault restart path. Build chain verified: `make z3660_emu` cross-compiles
+clean (arm-none-eabi-gcc present); BOOT.BIN packaging needs zynq-mkbootimage
+(`git clone https://github.com/antmicro/zynq-mkbootimage ~/git/zynq-mkbootimage && make` — one
+command, was not auto-run overnight). A FAILSAFE.bin (copy of known-good BOOT.BIN) is now ON the
+SD's FAT32 partition, so Z3660.bin experiments are recoverable.
+
+**Deployed state (morning of 2026-06-13):** SD carries the full-trace kernel (sum 55077:
+multi-method detect, BOUNCE_PAGES=32, nb==0 fail, deferred completions, dd.c reorder, crumb
+trace + 2 s heartbeat + proc dump + pflusha experiment). The crumb trace costs ~50 ms/IO — fine
+for diagnosis, strip the TRACE blocks for production. Old image is gone (overwritten per
+decision); golden VHD + pre-real-HW snapshot intact in amix-kerntools/hdf/.
