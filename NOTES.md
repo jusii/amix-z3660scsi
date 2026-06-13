@@ -265,3 +265,38 @@ word, state words, disp_store, FMOVEM store, real stage-B/C pipe words). The for
 m68k_do_rte_mmu030 reader already consumes all these fields. Next diagnostic: a DF-side probe
 (data-fault resume) + capture the SIGSEGV fault address to confirm the wrong-EA mechanism before
 the bigger port.
+
+## 2026-06-13 ~08:00: RESOLVED — Amix boots multiuser on real A4000+Z3660
+
+Two EMU-core MMU bugs (both in the Z3660 firmware fork ~/Devel/Omat/Amiga/Z3660 branch amix-boot),
+not the driver. Found by kernel-side serial instrumentation + core-dump analysis, fixed against the
+WinUAE 4.4.0 reference, each verified on real hardware:
+
+1. **c8b9398 — ifetch-fault resume (was SIGILL).** The format-$B bus-fault frame builder never set
+   ps bit 31 ("fault during opcode prefetch") and stacked stale regs.irc in the 0x14 opcode slot,
+   so m68k_do_rte_mmu030 restored mmu030_opcode = the previous instruction (the kernel's
+   return-to-user RTE 0x4E73) instead of -1; the run loop skipped its insretry refetch and
+   re-dispatched the stale RTE in user mode → privilege violation → SVR4 SIGILL at the first
+   instruction of every freshly demand-paged text page (init died at libc _rt_boot+0). Fix: set
+   ps |= 1<<31 when mmu030_opcode==-1, and stack mmu030_opcode in the 0x14 slot for format 0xb.
+   Result on HW: init ran through 8+ demand-paged text faults instead of dying at the first.
+
+2. **e3f9440 — mid-instruction resume (was SIGSEGV).** The same frame builder stacked ZERO for the
+   instruction-replay state the reader consumes (mmu030_ad[] value array @0x38-0x58, idx word @0x36,
+   mmu030_state[0..2] @0x30-0x34, mmu030_disp_store[] @0x1c/0x20, FMOVEM store), so a fault PART-WAY
+   through a non-idempotent instruction (MOVEM, (An)+/-(An), RMW, complex EA) restarted the whole
+   instruction with wrong replay state → wrong effective address → SIGSEGV. Fix: port the full
+   WinUAE format-$B frame storage for every consumed field at the offsets the reader reads, with the
+   write-fault pre-step (mmu030_ad[idx_done]=regs.wb3_data when !RW), using fault-time saved copies
+   (mmu030_page_fault:1869-1870). Result on HW: init SURVIVES — full rc tree, fsck runs on
+   /dev/rdsk/c6d0s1 (the Z3660 piscsi root disk), stable multiuser process tree.
+
+The amix-z3660 SCSI driver itself was correct from the first real-HW boot (carried 100% of boot I/O
+byte-perfect); the "hang" was always the EMU demand-paging the driver's pages back in. Driver
+production cleanup = a9ad84e (sum 43669), instrumentation stripped, verified multiuser in Amiberry.
+
+**Firmware build/deploy:** docker `full` image (z3660-build:latest) ships mkbootimage + Vitis; the
+host clone was never needed. `./docker/run.sh make -C z3660-firmware/Z-TURN/vitis_ide` (clean-rebuild
+Z3660_emu IN the container). Deploy BOOT.BIN as **Z3660.bin** via the ARM-console TFTP (path 0:);
+never overwrite on-SD BOOT.BIN/FAILSAFE.bin (FSBL fallback only catches load-failures). The HDF goes
+to exFAT path 1:/hdf/Amix.hdf (SPACE to switch from 0:).
