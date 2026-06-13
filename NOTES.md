@@ -239,3 +239,29 @@ multi-method detect, BOUNCE_PAGES=32, nb==0 fail, deferred completions, dd.c reo
 trace + 2 s heartbeat + proc dump + pflusha experiment). The crumb trace costs ~50 ms/IO — fine
 for diagnosis, strip the TRACE blocks for production. Old image is gone (overwritten per
 decision); golden VHD + pre-real-HW snapshot intact in amix-kerntools/hdf/.
+
+## 2026-06-13 morning: firmware fix DEPLOYED + on-hardware result (SIGILL fixed, SIGSEGV next)
+
+Built the fixed firmware via the docker `full` image (`z3660-build:latest` — ships mkbootimage
++ Vitis 2023.2 toolchain; `./docker/run.sh make -C .../vitis_ide`; clean-rebuild Z3660_emu in the
+container so the ELF is Vitis-built, NOT the host arm-gcc). Packaged BOOT.BIN (12330052 B),
+TFTP-deployed as **Z3660.bin** (FAT32 path 0:), readback-verified byte-identical. On-SD BOOT.BIN
++ FAILSAFE.bin untouched.
+
+**On-hardware result (commit c8b9398):** the SIGILL is GONE. The `[RTE-B-IF]` probe fires with
+`ps=80003f00` (bit 31 set) and `opcode=ffffffff` on every ifetch fault, and init now executes
+through **8 demand-paged text faults at 8 distinct PCs** (c100f348, c10127b4, c1011110, c1018e00,
+c1020d20, 80002a4e, c10154a8, c101fee0) — vs dying at the first (c100f348) before. The
+faulted-instruction REFETCH-on-resume is correct.
+
+**New blocker:** init now dies **SIGSEGV (p_wcode=CLD_DUMPED, p_wdata=11)**, not SIGILL — a
+distinct, later failure. Leading hypothesis = the OTHER half of the frame-$B simplification the
+analysis flagged: newcpu_common.cpp case 0xB stacks ZERO for the mmu030_ad[] value longs, the
+idx word (0x36), mmu030_state[0..2], and disp_store. A page fault PART-WAY through a non-idempotent
+instruction (MOVEM list, (An)+/-(An), RMW, complex EA) therefore loses replay state and restarts
+the whole instruction -> wrong effective address -> SIGSEGV. Fix = port the full WinUAE format-$B
+frame storage (WinUAE newcpu_common.cpp:1501-1565: mmu030_ad[] with wb3_data pre-step, the idx
+word, state words, disp_store, FMOVEM store, real stage-B/C pipe words). The fork's
+m68k_do_rte_mmu030 reader already consumes all these fields. Next diagnostic: a DF-side probe
+(data-fault resume) + capture the SIGSEGV fault address to confirm the wrong-EA mechanism before
+the bigger port.
