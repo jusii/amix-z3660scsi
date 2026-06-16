@@ -300,3 +300,27 @@ host clone was never needed. `./docker/run.sh make -C z3660-firmware/Z-TURN/viti
 Z3660_emu IN the container). Deploy BOOT.BIN as **Z3660.bin** via the ARM-console TFTP (path 0:);
 never overwrite on-SD BOOT.BIN/FAILSAFE.bin (FSBL fallback only catches load-failures). The HDF goes
 to exFAT path 1:/hdf/Amix.hdf (SPACE to switch from 0:).
+
+## 2026-06-16: KNOWN ISSUE — AMIX boot-time fsck is broken (FUTURE refactoring task)
+
+Boot-time fsck does NOT auto-repair a dirty/corrupt root: the box boots all the way to `login:` but
+the root UFS free-block bitmap stays broken, so the first **write** to a bad area panics
+`PANIC: free: freeing free block, dev=0x480016, fs = /`. Today a power-cycle-heavy firmware test
+session left root dirty and we hit this.
+
+**Why it's disabled (the structural bug to fix):** a naive "fsck-on-boot then reboot" `bcheckrc`
+LOOPS — fsck repairs → reboot → FS comes back dirty → fsck → reboot → … — because the reboot
+re-dirties root (root mounted RW and stamped `FSACTIVE` before being marked clean, and/or the reboot
+syncs stale in-core buffers back over the repair). So fsck-on-boot was effectively turned off,
+leaving dirty roots un-repaired. The RDB-parse fix (firmware `72661d4`) fixed the *fsck-EVERY-boot*
+half (find the RDB → mount root read-only first, not the no-RDB RW fallback); the other half — a
+`bcheckrc` that auto-repairs cleanly **once** — lived in the now-deleted `Amix-bcheckrc-fix.hdf`.
+
+**Manual recovery (until fixed):** single-user, **raw** device, re-run to clean, no-sync reboot:
+`init 1` → `fsck -y /dev/rdsk/c6d0s1` (NOT `/dev/dsk/` — the block device SIGBUSes a mounted root) →
+repeat until CLEAN → `reboot -n`. (SVR4.0 can't `mount -o remount,ro /` — "Invalid argument".)
+
+**Proper fix (future, AMIX-HDF /etc concern — build via amix-kerntools, not the driver/EMU):**
+`/etc/bcheckrc` on boot: mount root RO → `fsck -y` (auto-yes, no prompt) → if MODIFIED, `reboot -n`
+→ only mount RW + clear FSACTIVE after a clean pass. Fix the FSACTIVE-stamp ordering + no-sync reboot
+so it repairs once and proceeds — no loop, no manual fsck.
