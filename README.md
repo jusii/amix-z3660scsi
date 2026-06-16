@@ -26,9 +26,19 @@ src/kernel-patches/      reference combined sd.c + alien Makefile (as proven);
                          the kerntools harness now GENERATES these
 driver.conf              0x144B0001 z3660queue "Z3660 SCSI" z3660.c
 configs/                 build-box .uae (shared golden image)
-repo/                    shanshe/Z3660 upstream clone (gitignored, ~574 MB)
+assets/                  local reference material (gitignored): WinUAE 4.4.0 sources,
+                         known-good firmware, deploy scripts -- see assets/README.md
 NOTES.md                 protocol scouting + implementation status + test plan
 ```
+
+The upstream firmware source (formerly cloned into a gitignored `repo/`) is not kept in
+this repo. Re-fetch it when needed (it is read-only reference for the piscsi protocol):
+
+```sh
+git clone --filter=blob:none https://github.com/shanshe/Z3660 repo
+```
+
+The full firmware fork we actually build/deploy lives separately at `~/Devel/Omat/Amiga/Z3660`.
 
 ## Building
 

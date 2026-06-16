@@ -3,6 +3,7 @@ hdf/
 repo/
 work/
 tmp/
+assets/
 build/
 core
 *~
