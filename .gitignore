@@ -8,3 +8,4 @@ build/
 core
 *~
 .DS_Store
+cold-cycle-test/
