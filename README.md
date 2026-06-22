@@ -10,6 +10,18 @@ mailbox protocol** (AutoConfig `0x144B:0x01`, synchronous MMIO register
 mailbox, no IRQ/poll). See [NOTES.md](NOTES.md) for the full protocol and
 design.
 
+## Scope / responsibility
+
+This repo is **the AMIX SCSI driver for the Z3660, and nothing else.** It is one of
+several repos in the AMIX-on-Z3660 effort, each with a single job:
+
+- **Ethernet** driver → [`../amix-z3660net`](../amix-z3660net)
+- **Firmware / 68k-emulator** (and its bring-up investigations: MMU, fsck, lpsched
+  coherency) → `~/Devel/Omat/Amiga/Z3660` (`docs/investigations/`)
+- **Build harness, golden image, host-ops tooling, build configs** → [`../amix-kerntools`](../amix-kerntools)
+
+The full map is in [`../amix-kerntools/REPOS.md`](../amix-kerntools/REPOS.md).
+
 ## Status (2026-06)
 
 **Driver written, integrated, clean-gated, and boots** ✅ — compiled with the
@@ -25,11 +37,13 @@ src/z3660.c              the driver (map, geometry, chunked R/W, queue entry)
 src/kernel-patches/      reference combined sd.c + alien Makefile (as proven);
                          the kerntools harness now GENERATES these
 driver.conf              0x144B0001 z3660queue "Z3660 SCSI" z3660.c
-configs/                 build-box .uae (shared golden image)
 assets/                  local reference material (gitignored): WinUAE 4.4.0 sources,
-                         known-good firmware, deploy scripts -- see assets/README.md
+                         rollback firmware baselines, deploy scripts -- see assets/README.md
 NOTES.md                 protocol scouting + implementation status + test plan
 ```
+
+The build-box `.uae` config now lives with the build harness at
+`../amix-kerntools/configs/amix-z3660-build.uae`.
 
 The upstream firmware source (formerly cloned into a gitignored `repo/`) is not kept in
 this repo. Re-fetch it when needed (it is read-only reference for the piscsi protocol):
@@ -47,7 +61,7 @@ Shared tooling lives in the sibling [amix-kerntools](../amix-kerntools/) repo
 
 ```sh
 sh ../grimoire-amix/tools/host-net/amix-lan-up.sh
-amiberry --config configs/amix-z3660-build.uae &
+amiberry --config ../amix-kerntools/configs/amix-z3660-build.uae &
 ../amix-kerntools/build-kernel.sh ../amix-z3660                  # Z3660 kernel
 ../amix-kerntools/build-kernel.sh ../amix-a4091 ../amix-z3660    # universal
 ```
