@@ -1,7 +1,7 @@
 # Z3660 SCSI → Amix driver — notes
 
-(Repo `amix-z3660`; builds go through the sibling `amix-kerntools` harness +
-golden image — `../amix-kerntools/build-kernel.sh ../amix-z3660`. Started as
+(Repo `amix-z3660scsi`; builds go through the sibling `amix-kerntools` harness +
+golden image — `../amix-kerntools/build-kernel.sh ../amix-z3660scsi`. Started as
 scouting notes; §"Implementation status" is the living state.)
 
 Goal: a native Amix (SVR4/68030) driver for the **Z3660** accelerator's onboard SCSI, so Amix on a real
@@ -291,7 +291,7 @@ WinUAE 4.4.0 reference, each verified on real hardware:
    (mmu030_page_fault:1869-1870). Result on HW: init SURVIVES — full rc tree, fsck runs on
    /dev/rdsk/c6d0s1 (the Z3660 piscsi root disk), stable multiuser process tree.
 
-The amix-z3660 SCSI driver itself was correct from the first real-HW boot (carried 100% of boot I/O
+The amix-z3660scsi SCSI driver itself was correct from the first real-HW boot (carried 100% of boot I/O
 byte-perfect); the "hang" was always the EMU demand-paging the driver's pages back in. Driver
 production cleanup = a9ad84e (sum 43669), instrumentation stripped, verified multiuser in Amiberry.
 

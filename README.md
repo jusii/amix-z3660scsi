@@ -1,4 +1,4 @@
-# amix-z3660 — native Amix SCSI driver for the Z3660 accelerator
+# amix-z3660scsi — native Amix SCSI driver for the Z3660 accelerator
 
 A native Amix (Commodore SVR4, 68030/EMU) driver for the **Z3660** accelerator's
 onboard SCSI, so Amix on a real A4000+Z3660 stops relying on the buggy
@@ -43,7 +43,7 @@ NOTES.md                 protocol scouting + implementation status + test plan
 ```
 
 The build-box `.uae` config now lives with the build harness at
-`../amix-kerntools/configs/amix-z3660-build.uae`.
+`../amix-kerntools/configs/amix-z3660scsi-build.uae`.
 
 The upstream firmware source (formerly cloned into a gitignored `repo/`) is not kept in
 this repo. Re-fetch it when needed (it is read-only reference for the piscsi protocol):
@@ -61,9 +61,9 @@ Shared tooling lives in the sibling [amix-kerntools](../amix-kerntools/) repo
 
 ```sh
 sh ../grimoire-amix/tools/host-net/amix-lan-up.sh
-amiberry --config ../amix-kerntools/configs/amix-z3660-build.uae &
-../amix-kerntools/build-kernel.sh ../amix-z3660                  # Z3660 kernel
-../amix-kerntools/build-kernel.sh ../amix-a4091 ../amix-z3660    # universal
+amiberry --config ../amix-kerntools/configs/amix-z3660scsi-build.uae &
+../amix-kerntools/build-kernel.sh ../amix-z3660scsi                  # Z3660 kernel
+../amix-kerntools/build-kernel.sh ../amix-a4091 ../amix-z3660scsi    # universal
 ```
 
 Never install an ungated kernel — Amix's `ld` intermittently corrupts the
