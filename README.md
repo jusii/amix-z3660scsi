@@ -2,7 +2,7 @@
 
 A native Amix (Commodore SVR4, 68030/EMU) driver for the **Z3660** accelerator's
 onboard SCSI, so Amix on a real A4000+Z3660 stops relying on the buggy
-A3000-WD33C93 emulation. Successor to the [amix-a4091](../amix-a4091/) project,
+A3000-WD33C93 emulation. Successor to the [amix-a4091](https://github.com/jusii/amix-a4091) project,
 which built the framework, build environment, and gotcha catalog this reuses.
 
 The Z3660's "SCSI" is not a SCSI chip at all — it is the PiStorm **piscsi
@@ -15,12 +15,12 @@ design.
 This repo is **the AMIX SCSI driver for the Z3660, and nothing else.** It is one of
 several repos in the AMIX-on-Z3660 effort, each with a single job:
 
-- **Ethernet** driver → [`../amix-z3660net`](../amix-z3660net)
+- **Ethernet** driver → [`amix-z3660net`](https://github.com/jusii/amix-z3660net)
 - **Firmware / 68k-emulator** (and its bring-up investigations: MMU, fsck, lpsched
-  coherency) → `~/Devel/Omat/Amiga/Z3660` (`docs/investigations/`)
-- **Build harness, golden image, host-ops tooling, build configs** → [`../amix-kerntools`](../amix-kerntools)
+  coherency) → [`Z3660-amix`](https://github.com/jusii/Z3660-amix) (`docs/investigations/`)
+- **Build harness, golden image, host-ops tooling, build configs** → [`amix-kerntools`](https://github.com/jusii/amix-kerntools)
 
-The full map is in [`../amix-kerntools/REPOS.md`](../amix-kerntools/REPOS.md).
+The full map is in [`amix-kerntools/REPOS.md`](https://github.com/jusii/amix-kerntools/blob/master/REPOS.md).
 
 ## Status (2026-06)
 
