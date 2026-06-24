@@ -1,0 +1,19 @@
+--- amiga/alien/dd.c.orig
++++ amiga/alien/dd.c
+@@ -219,8 +219,15 @@
+ 				bp->b_flags |= B_ERROR;
+ 		}
+ 	dp->bhead = bp->av_forw;
+-	iodone( bp);
++	/*
++	 * Issue the next queued buf BEFORE iodone(): iodone's b_iodone
++	 * callback (pageio chunk resubmit) re-enters ddstrategy synchronously;
++	 * with the old order it raced this trailing startio and double-issued
++	 * the same &dp->com (self-linked sdcom, lost completions).  With the
++	 * new order ddstrategy sees bhead non-empty and only enqueues.
++	 */
+ 	startio( FIRST, dp);
++	iodone( bp);
+ }
+ 
+ 

@@ -108,11 +108,15 @@ which Amiberry can't exercise — that waits on the emulator below or real HW.)
   `z3660_rw()` (chunked ≤64 KB block I/O via the synchronous command-register write + bounce), and
   `z3660queue()` (interprets TEST_UNIT_READY / INQUIRY / READ_CAPACITY / MODE_SENSE in software and routes
   READ/WRITE 6/10 to `z3660_rw`). Multi-byte SCSI fields written byte-wise big-endian (68030 alignment-safe).
-- **`src/kernel-patches/sd.c`** — adds `0x144B0001, &z3660queue, "Z3660 SCSI"` to `scsicard[]` (+ the
-  `z3660queue` extern). No `support.c`/`autocon()` change needed — the Z3660 SCSI is a normal AutoConfig
-  board, so the generic table search finds it. (`SDCARDS=2`, so ≤2 controllers register at once — fine for
-  an A4000+Z3660.)
-- **`src/kernel-patches/alien-Makefile`** — adds `z3660.o` to `OBJ`.
+- **`driver.conf`** — declares the mechanical wiring (`0x144B0001 z3660queue "Z3660 SCSI" z3660.c
+  probe=z3660present`). kerntools generates the `sd.c` `scsicard[]` row + `z3660queue` extern (+
+  `sdcardbase()`) and the `alien` Makefile `z3660.o` `OBJ` entry from it, so this repo ships no copy of
+  those files. No `support.c`/`autocon()` change is needed — the Z3660 SCSI is a normal AutoConfig board,
+  so the generic table search finds it. (`SDCARDS=2`, so ≤2 controllers register at once — fine for an
+  A4000+Z3660.)
+- **`src/kernel-patches/dd.c.patch`** — a unified diff against stock `amiga/alien/dd.c` (issue the next
+  queued buf before `iodone()` in `ihandle()`; see the real-HW findings below). kerntools applies it to
+  the stock tree with `patch`, idempotently.
 
 Verified on the Amix build box (`../amix-a4091/hdf/Amix-dbg.hdf`):
 - `z3660.c` compiles clean with the K&R SVR4 `cc` on the first try (`cc -c -O`).
