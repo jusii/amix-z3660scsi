@@ -1,7 +1,7 @@
 # Z3660 SCSI → Amix driver — notes
 
 (Repo `amix-z3660scsi`; builds go through the sibling `amix-kerntools` harness +
-golden image — `../amix-kerntools/build-kernel.sh ../amix-z3660scsi`. Started as
+golden image — `(cd ../amix-kerntools && ./amix-build z3660scsi)`. Started as
 scouting notes; §"Implementation status" is the living state.)
 
 Goal: a native Amix (SVR4/68030) driver for the **Z3660** accelerator's onboard SCSI, so Amix on a real
@@ -158,13 +158,13 @@ The protocol is trivial to emulate — it's exactly the shape Amiberry/WinUAE al
 ## Sources
 - `repo/z3660-drivers/scsi/z3660_scsi.c`, `z3660_scsi.h`, `z3660_scsi_enums.h`, `bootrom.asm`.
 - `repo/KNOWN_ISSUES.md` (DMA-not-in-EMU, SCSI-SD-emulation bug history).
-- The A4091-on-Amix predecessor project (`../amix-a4091/`) — framework, build env, gotchas, clean-gate.
+- The A4091-on-Amix predecessor project ([`amix-a4091`](https://github.com/jusii/amix-a4091)) — framework, build env, gotchas, clean-gate.
 - `a2065.cpp` (WinUAE/Amiberry) — the AutoConfig-board + MMIO-bank emulation model.
 
 ## Real-hardware findings (2026-06-12 overnight session)
 
 First contact with the physical A4000+Z3660. Everything below verified against the
-**deployed firmware fork** (`~/Devel/Omat/Amiga/Z3660`, branch `amix-boot`) and live boots.
+**deployed firmware fork** (`Z3660-amix`, branch `amix-boot`) and live boots.
 
 - **Board identity:** the piscsi window rides the combined RTG+SCSI window. Autoconfig
   products under manuf 0x144B: Z2 RTG+SCSI combo = **product 0x03** (advertises 64KB),
@@ -233,7 +233,7 @@ crumb decode in the iteration commits). Chronology of findings:
    drivers). Fixed (issue-next-then-iodone) + z3660 completions deferred via timeout() — both
    verified booting in Amiberry.
 
-**Firmware fix domain:** ~/Devel/Omat/Amiga/Z3660 branch amix-boot, cpummu030.cpp /
+**Firmware fix domain:** the `Z3660-amix` firmware fork, branch amix-boot, cpummu030.cpp /
 m68k_run_mmu030 ifetch-fault restart path. Build chain verified: `make z3660_emu` cross-compiles
 clean (arm-none-eabi-gcc present); BOOT.BIN packaging needs zynq-mkbootimage
 (`git clone https://github.com/antmicro/zynq-mkbootimage ~/git/zynq-mkbootimage && make` — one
@@ -274,7 +274,7 @@ the bigger port.
 
 ## 2026-06-13 ~08:00: RESOLVED — Amix boots multiuser on real A4000+Z3660
 
-Two EMU-core MMU bugs (both in the Z3660 firmware fork ~/Devel/Omat/Amiga/Z3660 branch amix-boot),
+Two EMU-core MMU bugs (both in the `Z3660-amix` firmware fork, branch amix-boot),
 not the driver. Found by kernel-side serial instrumentation + core-dump analysis, fixed against the
 WinUAE 4.4.0 reference, each verified on real hardware:
 
