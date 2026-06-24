@@ -34,10 +34,12 @@ autoboot ROM came from the a4091.device tree), **not** the transport. ✅ (read 
   `READ64=0x64`/`WRITE64=0x60`; transfer params `READ_ADDR1..4 = 0x20/24/28/2C`,
   `WRITE_ADDR1..4 = 0x240/244/248/24C` (= block-offset, length, **buffer address**, io_actual);
   `USED_DMA=0x9C`; `DRVNUMX=0x90`. Plus partition/FS helpers (`GETPART`, `NEXTFS`, `LOADFS`…) we can ignore.
-- **A READ/WRITE is:** write `DRVNUMX`(unit) → write `*_ADDR1`(block offset), `*_ADDR2`(len),
-  `*_ADDR3`(buffer addr) → **write the command register** (`READBYTES`/`WRITEBYTES` with the unit as the
-  value). That single command-register write is the **trigger AND the completion**: the ARM intercepts the
-  Zorro III bus cycle and finishes the whole transfer before the write returns. **No poll, no IRQ.** ✅
+- **A READ/WRITE is:** write `DRVNUMX`(unit) → write the operation's **own** address triple (read and
+  write use *separate* registers, never shared): a **READ** uses `READ_ADDR1/2/3 = 0x20/0x24/0x28`, a
+  **WRITE** uses `WRITE_ADDR1/2/3 = 0x240/0x244/0x248` — `ADDR1`=block number, `ADDR2`=byte length,
+  `ADDR3`=buffer addr → **write the command register** (`READ=0x04`/`WRITE=0x00`, value = unit). That
+  single command-register write is the **trigger AND the completion**: the ARM intercepts the Zorro III
+  bus cycle and finishes the whole transfer before the write returns. **No poll, no IRQ.** ✅
 - **Data movement — bounce buffer at `board_base + 0x80000`:** the ARM accesses the Amiga buffer at the
   address in `*_ADDR3` directly when it can; for **low/chip RAM (`< 0x08000000`)** — and in **EMU mode,
   where direct Zorro-III DMA "is not implemented"** (KNOWN_ISSUES) — it bounces through a buffer at

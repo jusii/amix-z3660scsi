@@ -23,8 +23,10 @@
  *                      DMA directly -- which in EMU/030 mode is ALWAYS, and Amix RAM
  *                      is < 0x08000000 so the firmware always bounces)
  *
- *   A block READ/WRITE is:  write DRVNUMX(unit); write *_ADDR1(block number),
- *   *_ADDR2(byte length), *_ADDR3(buffer phys addr); then write the command
+ *   A block READ/WRITE is:  write DRVNUMX(unit); write the operation's OWN address
+ *   triple (read/write use separate registers, never shared) -- READ_ADDR1/2/3 =
+ *   0x20/0x24/0x28, WRITE_ADDR1/2/3 = 0x240/0x244/0x248 -- ADDR1=block number,
+ *   ADDR2=byte length, ADDR3=buffer phys addr; then write the command
  *   register (READ=0x04 / WRITE=0x00, value = unit).  That single command-register
  *   write is BOTH the trigger and the completion -- the ARM intercepts the Zorro III
  *   bus cycle and finishes the whole transfer before the write returns.  After a
