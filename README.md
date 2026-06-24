@@ -52,9 +52,6 @@ assets/                  local reference material (gitignored): WinUAE 4.4.0 sou
 NOTES.md                 protocol scouting + implementation status + test plan
 ```
 
-The build-box `.uae` config now lives with the build harness at
-`../amix-kerntools/configs/amix-z3660scsi-build.uae`.
-
 The upstream firmware source (formerly cloned into a gitignored `repo/`) is not kept in
 this repo. Re-fetch it when needed (it is read-only reference for the piscsi protocol):
 
@@ -62,7 +59,8 @@ this repo. Re-fetch it when needed (it is read-only reference for the piscsi pro
 git clone --filter=blob:none https://github.com/shanshe/Z3660 repo
 ```
 
-The full firmware fork we actually build/deploy lives separately at `~/Devel/Omat/Amiga/Z3660`.
+The full firmware fork we actually build/deploy lives in its own repo,
+[`jusii/Z3660-amix`](https://github.com/jusii/Z3660-amix).
 
 ## Building
 
@@ -76,12 +74,13 @@ entry from `driver.conf`, and applies our
 [`src/kernel-patches/dd.c.patch`](src/kernel-patches/dd.c.patch) to the stock
 `amiga/alien/dd.c` (idempotently — re-applying is skipped).
 
-With the kerntools repo checked out alongside this one:
+With the kerntools repo checked out alongside this one, bring up your Amix box
+(real hardware, or your own WinUAE/Amiberry config with an a2065 NIC on tap0),
+then run the single build entry point:
 
 ```sh
-amiberry --config ../amix-kerntools/configs/amix-z3660scsi-build.uae &
-../amix-kerntools/build-kernel.sh ../amix-z3660scsi                  # Z3660-only kernel
-../amix-kerntools/build-kernel.sh ../amix-a4091 ../amix-z3660scsi    # universal kernel
+(cd ../amix-kerntools && ./amix-build z3660scsi)          # Z3660-only kernel
+(cd ../amix-kerntools && ./amix-build a4091 z3660scsi)    # universal kernel
 ```
 
 Never install an ungated kernel — Amix's `ld` intermittently corrupts the
