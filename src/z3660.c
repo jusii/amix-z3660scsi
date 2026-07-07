@@ -76,6 +76,13 @@
 #define	P_READ_ADDR3	0x28		/* buffer address */
 #define	P_DRVNUMX	0x90		/* select unit for subsequent ops */
 #define	P_USED_DMA	0x9C		/* read after READ: !=0 => data is in bounce */
+/*
+ * Peripheral device type of the currently-selected unit: 0x00 = direct-access
+ * disk, 0x05 = read-only CD-ROM.  This is the SINGLE source of device type.
+ * P_PDT MUST stay in lockstep with the firmware register PISCSI_CMD_PDT (Z3660
+ * src/scsi/z3660_scsi_enums.h) and its a3000_scsi mirror -- all three are 0xA0.
+ */
+#define	P_PDT		0xA0
 #define	P_WRITE_ADDR1	0x240
 #define	P_WRITE_ADDR2	0x244
 #define	P_WRITE_ADDR3	0x248
@@ -110,6 +117,14 @@ static long		board_phys;
 /* last-transaction diagnostics (read via /dev/mem or a probe tool) */
 ulong	z3660_lastblock, z3660_lastlen, z3660_blocks0, z3660_dma;
 uchar	z3660_rc, z3660_lastcmd, z3660_present;
+
+/*
+ * Pending REQUEST SENSE data for the next C_REQ_SENSE.  A zero key means
+ * "nothing pending" -- the disk path never sets it, so its REQUEST SENSE keeps
+ * returning all-zeros exactly as before.  A CD-ROM WRITE reject sets DATA
+ * PROTECT here (0x07/0x27/0x00), mirroring set_sense() in the a3000_scsi mirror.
+ */
+static uchar	z3660_sense_key, z3660_sense_asc, z3660_sense_ascq;
 
 /*
  * Map the register window and the bounce buffer into kernel VA and verify the
@@ -194,6 +209,23 @@ int	unit;
 }
 
 /*
+ * Peripheral device type of a unit, read straight from the piscsi P_PDT
+ * mailbox register -- the SINGLE source of device type (0x00 = direct-access
+ * disk, 0x05 = CD-ROM).  P_PDT reflects whatever unit DRVNUMX last selected, so
+ * select it first (as backend_drive_present()/fetch_geometry() do in the
+ * a3000_scsi Path B mirror), then read.
+ */
+static ulong
+z3660_pdt( unit)
+int	unit;
+{
+	if (unit < 0 || unit > 7)
+		return 0x00;
+	WRLONG( P_DRVNUMX, unit);
+	return RDLONG( P_PDT);
+}
+
+/*
  * Run one block READ or WRITE through the piscsi mailbox, chunked to <=64KB.
  * block = starting LBA, blocks = block count, bs = block size, data = buffer.
  */
@@ -262,7 +294,7 @@ int		c;
 struct sdcom	*cp;
 {
 	int	e, i, unit, write;
-	ulong	block, blocks, bs, nb;
+	ulong	block, blocks, bs, nb, pdt;
 	uchar	*data;
 	uchar	op;
 
@@ -279,6 +311,7 @@ struct sdcom	*cp;
 
 	WRLONG( P_DRVNUMX, unit);
 	bs = z3660_blocksize( unit);
+	pdt = z3660_pdt( unit);		/* 0x00 disk, 0x05 CD-ROM (sole device-type source) */
 
 	cp->status = 0;			/* default GOOD */
 	cp->okay   = TRUE;
@@ -290,24 +323,59 @@ struct sdcom	*cp;
 		break;
 
 	case C_REQ_SENSE:
-		if (data)
+		if (data) {
 			for (i = 0; i < (int)cp->nbyte && i < 18; ++i)
-				data[i] = 0;		/* NO SENSE */
+				data[i] = 0;		/* default: NO SENSE */
+			/*
+			 * Return a pending condition (a CD-ROM WRITE reject) in
+			 * fixed format; dd.c reads data[2] (key) and data[12]
+			 * (ASC).  Consumed on read.  With nothing pending this
+			 * leaves the historical all-zeros disk response intact.
+			 */
+			if (z3660_sense_key && cp->nbyte >= 14) {
+				data[0] = 0x70;		/* current error, fixed fmt */
+				data[2] = z3660_sense_key;
+				data[7] = 0x0A;		/* additional sense length  */
+				data[12] = z3660_sense_asc;
+				data[13] = z3660_sense_ascq;
+			}
+			z3660_sense_key = z3660_sense_asc = z3660_sense_ascq = 0;
+		}
 		break;
 
 	case C_INQUIRY:
 		if (data) {
 			for (i = 0; i < (int)cp->nbyte; ++i) data[i] = 0;
-			if (cp->nbyte >= 5) {
-				data[0] = 0x00;		/* direct-access device   */
-				data[1] = 0x00;		/* fixed (not removable)  */
-				data[2] = 0x02;		/* SCSI-2                 */
-				data[3] = 0x02;		/* response data format 2 */
-				data[4] = 40 - 4;	/* additional length      */
+			if (pdt == 0x05) {
+				/*
+				 * CD-ROM -- byte-match the a3000_scsi Path B
+				 * mirror: 05 80 02 02 1F 00 00 00, vendor
+				 * "Z3660   ", product "AMIX CD-ROM     ", rev
+				 * "0.1 " (36-byte SCSI-2 INQUIRY).
+				 */
+				if (cp->nbyte >= 5) {
+					data[0] = 0x05;		/* CD-ROM device type     */
+					data[1] = 0x80;		/* RMB = removable medium */
+					data[2] = 0x02;		/* SCSI-2                 */
+					data[3] = 0x02;		/* response data format 2 */
+					data[4] = 0x1F;		/* additional length (36) */
+				}
+				{ static char cdid[] = "Z3660   AMIX CD-ROM     0.1 ";
+				  for (i = 0; i < 28 && (8 + i) < (int)cp->nbyte; ++i)
+					data[8 + i] = cdid[i]; }
+			} else {
+				/* direct-access disk -- unchanged (validated path) */
+				if (cp->nbyte >= 5) {
+					data[0] = 0x00;		/* direct-access device   */
+					data[1] = 0x00;		/* fixed (not removable)  */
+					data[2] = 0x02;		/* SCSI-2                 */
+					data[3] = 0x02;		/* response data format 2 */
+					data[4] = 40 - 4;	/* additional length      */
+				}
+				{ static char id[] = "Z3660   PiSCSI Disk      0.1 ";
+				  for (i = 0; i < 28 && (8 + i) < (int)cp->nbyte; ++i)
+					data[8 + i] = id[i]; }
 			}
-			{ static char id[] = "Z3660   PiSCSI Disk      0.1 ";
-			  for (i = 0; i < 28 && (8 + i) < (int)cp->nbyte; ++i)
-				data[8 + i] = id[i]; }
 		}
 		break;
 
@@ -330,6 +398,8 @@ struct sdcom	*cp;
 			blocks  = z3660_nblocks( unit);
 			nbk     = (blocks - 1) & 0xFFFFFF;	/* 24-bit block count  */
 			data[0] = 3 + 8;			/* mode data length        */
+			if (pdt == 0x05)
+				data[2] = 0x80;			/* CD-ROM: write-protected (WP) */
 			data[3] = 8;				/* block descriptor length */
 			data[5] = (nbk >> 16); data[6] = (nbk >> 8); data[7] = nbk;
 			data[9] = (bs >> 16);  data[10] = (bs >> 8); data[11] = bs;
@@ -356,6 +426,22 @@ struct sdcom	*cp;
 	rw:
 		z3660_lastblock = block;
 		z3660_lastlen   = blocks * bs;
+		/*
+		 * CD-ROM is read-only: reject WRITE(6)/WRITE(10) with a
+		 * CHECK CONDITION / DATA PROTECT sense, exactly as the
+		 * a3000_scsi Path B mirror does -- never touch the medium.
+		 * okay = TRUE + a non-zero SCSI status is the framework's
+		 * "command completed, CHECK CONDITION" signal (see a3091.c);
+		 * dd.c then issues REQUEST SENSE and reads DATA PROTECT.
+		 */
+		if (write && pdt == 0x05) {
+			z3660_sense_key  = 0x07;	/* DATA PROTECT    */
+			z3660_sense_asc  = 0x27;	/* write protected */
+			z3660_sense_ascq = 0x00;
+			cp->status = 0x02;		/* CHECK CONDITION */
+			cp->okay   = TRUE;
+			break;
+		}
 		nb = z3660_nblocks( unit);
 		z3660_blocks0 = nb;
 		/* nb == 0 means the firmware has no drive mapped at this unit --
