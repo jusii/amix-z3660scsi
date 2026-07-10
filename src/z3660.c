@@ -95,6 +95,7 @@
 #define	C_INQUIRY	0x12
 #define	C_MODE_SENSE6	0x1A
 #define	C_START_STOP	0x1B
+#define	C_MODE_SENSE10	0x5A
 #define	C_READ_CAP10	0x25
 #define	C_READ_6	0x08
 #define	C_WRITE_6	0x0A
@@ -408,6 +409,30 @@ struct sdcom	*cp;
 			data[5] = (nbk >> 16); data[6] = (nbk >> 8); data[7] = nbk;
 			data[9] = (bs >> 16);  data[10] = (bs >> 8); data[11] = bs;
 		}
+		break;
+
+	case C_MODE_SENSE10:
+		/*
+		 * CD-ROM MODE SENSE(10).  The driver never had a 0x5A case, so a
+		 * CD MODE SENSE(10) used to fall to the default hard error; cdfs
+		 * never issues it, but the a3000_scsi Path B mirror answers it,
+		 * so match that oracle: 8-byte header + 8-byte block descriptor,
+		 * no rigid-geometry pages, WP set.  A disk (pdt != 0x05) is left
+		 * to the SAME hard error as before -- the disk path is untouched.
+		 */
+		if (pdt == 0x05 && data && cp->nbyte >= 16) {
+			ulong	nbk;
+			for (i = 0; i < (int)cp->nbyte; ++i) data[i] = 0;
+			blocks  = z3660_nblocks( unit);
+			nbk     = (blocks - 1) & 0xFFFFFF;	/* 24-bit block count  */
+			data[0] = 0; data[1] = 8 + 8 - 2;	/* mode data length 0x000E */
+			data[3] = 0x80;				/* CD-ROM: write-protected (WP) */
+			data[7] = 8;				/* block descriptor length */
+			data[9]  = (nbk >> 16); data[10] = (nbk >> 8); data[11] = nbk;
+			data[13] = (bs >> 16);  data[14] = (bs >> 8);  data[15] = bs;
+			break;
+		}
+		cp->status = 0xff; cp->okay = FALSE;	/* disk / short buf: as before */
 		break;
 
 	case C_WRITE_6:
