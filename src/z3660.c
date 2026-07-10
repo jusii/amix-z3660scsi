@@ -111,8 +111,12 @@ static volatile uchar	*regs;		/* board+0x2000 register window  */
 static volatile uchar	*bounce;	/* board+0x80000 bounce buffer   */
 static long		board_phys;
 
+#ifndef	HOST_TEST
 #define	WRLONG(cmd,val)	(*(volatile ulong *)(regs + (cmd)) = (ulong)(val))
 #define	RDLONG(cmd)	(*(volatile ulong *)(regs + (cmd)))
+#endif	/* !HOST_TEST: the host harness force-includes its own WRLONG/RDLONG
+	 * (test/host/mock_regs.h) that drive a mock piscsi mailbox instead of
+	 * real MMIO.  Inert for the kernel build -- no HOST_TEST, no change. */
 
 /* last-transaction diagnostics (read via /dev/mem or a probe tool) */
 ulong	z3660_lastblock, z3660_lastlen, z3660_blocks0, z3660_dma;
