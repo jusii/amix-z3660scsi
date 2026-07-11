@@ -24,6 +24,9 @@
 
 extern bool z3660queue();		/* bool == char (rico.h); K&R decl */
 
+/* permanent reentrancy counters exported by the driver (kmem-readable on HW) */
+extern unsigned long z3660_nest_depth, z3660_nest_hits;
+
 /* CD units on this mock bus: 6 = CD-ROM (also the detection-probe unit), 0 = disk. */
 #define U_CD	6
 #define U_DISK	0
@@ -379,6 +382,94 @@ static void stretch_cd_parity()
 }
 
 /* ====================================================================== */
+/* GATING: spl6 re-entry bracket -- a callout-nested mailbox transaction    */
+/* cannot interleave an in-flight one (the T2.P3 corruption family).        */
+/* ====================================================================== */
+
+static int reentry_hook_calls;	/* times the in-flight hook fired          */
+static int reentry_reentered;	/* did a nested z3660queue() actually run?  */
+static int reentry_guard;	/* re-enter at most once (no infinite loop) */
+
+/*
+ * The simulated clock-callout path: while a mailbox transaction is in flight,
+ * a level-2 clock tick would dispatch z3660done -> ihandle -> startio -> a
+ * SECOND z3660queue().  The mock fires this hook from inside the in-flight
+ * command (do_read/do_write).  It only actually re-enters when the clock is
+ * UNMASKED -- exactly the gate spl6() closes on real hardware.  When the driver
+ * holds spl6 (bracket present) mock_clock_masked() is true and the callout is
+ * deferred, so nothing interleaves; with the bracket artificially absent the
+ * nested transaction runs mid-flight and the driver's z3660_nest_hits records
+ * the breach.
+ */
+static void reentry_hook()
+{
+	static uchar	nbuf[2048];
+	struct sdcom	sc;
+
+	reentry_hook_calls++;
+	if (reentry_guard)
+		return;
+	reentry_guard = 1;
+	if (mock_clock_masked())
+		return;			/* spl6 bracket holds -> callout deferred */
+
+	reentry_reentered = 1;
+	memset( &sc, 0, sizeof sc);
+	sc.unit  = (uint)U_CD;
+	sc.addr  = (caddr_t)nbuf;
+	sc.nbyte = 2048;
+	sc.cdb[0] = 0x28; sc.cdb[5] = 5; sc.cdb[8] = 1;	/* READ(10) 1 sector @ LBA 5 */
+	sc.intr  = (void (*)())test_intr;
+	z3660queue( U_CD, &sc);		/* nested transaction, mid-flight */
+}
+
+static void test_reentry()
+{
+	uchar		cdb[10], buf[2048];
+	unsigned char	*back = mock_backing( U_CD);
+
+	printf("\n=== GATE: spl6 bracket vs callout-nested mailbox transaction ===\n");
+
+	/* ---- Run 1: bracket PRESENT -- spl6 raises IPL, clock masked ---- */
+	z3660_nest_depth = 0; z3660_nest_hits = 0;
+	reentry_hook_calls = reentry_reentered = reentry_guard = 0;
+	mock_spl_disabled = 0;
+	mock_set_inflight_hook( reentry_hook);
+
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[8] = 1;	/* READ(10) LBA 0 */
+	memset( buf, 0, sizeof buf);
+	run_cmd( U_CD, cdb, 10, buf, 2048);
+
+	CHECK( reentry_hook_calls >= 1, "re-entry: in-flight hook fired");
+	CHECK( reentry_reentered == 0, "re-entry: nested transaction DEFERRED by spl6 bracket");
+	CHECK( z3660_nest_hits == 0, "re-entry: no nesting hit while bracketed");
+	CHECK( g_okay && g_status == 0, "re-entry: outer READ still completes GOOD");
+	CHECK( memcmp( buf, back + 0, 2048) == 0,
+	       "re-entry: outer READ data intact (no interleave)");
+
+	/* ---- Run 2: bracket ABSENT -- spl6 no-op, clock unmasked ---- */
+	z3660_nest_depth = 0; z3660_nest_hits = 0;
+	reentry_hook_calls = reentry_reentered = reentry_guard = 0;
+	mock_spl_disabled = 1;			/* artificially remove the bracket */
+	mock_set_inflight_hook( reentry_hook);
+
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[8] = 1;	/* READ(10) LBA 0 */
+	memset( buf, 0, sizeof buf);
+	run_cmd( U_CD, cdb, 10, buf, 2048);
+
+	CHECK( reentry_reentered == 1, "re-entry: nested transaction interleaves when bracket absent");
+	CHECK( z3660_nest_hits >= 1, "re-entry: z3660_nest_hits counts the attempted re-entry");
+	printf("       (bracket-absent nest_hits=%lu, outer READ %s)\n",
+	       z3660_nest_hits,
+	       memcmp( buf, back + 0, 2048) == 0 ? "clean" : "CORRUPTED by interleave");
+
+	/* restore harness state for anything that runs after */
+	mock_set_inflight_hook( (void (*)())0);
+	mock_spl_disabled = 0;
+	z3660_nest_depth = 0; z3660_nest_hits = 0;
+}
+
+/* ====================================================================== */
 int main()
 {
 	mock_reset();
@@ -398,6 +489,8 @@ int main()
 	test_disk_write10_frozen();
 
 	test_tur_both();
+
+	test_reentry();
 
 	stretch_cd_parity();
 

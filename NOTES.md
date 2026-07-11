@@ -330,3 +330,78 @@ repeat until CLEAN → `reboot -n`. (SVR4.0 can't `mount -o remount,ro /` — "I
 `/etc/bcheckrc` on boot: mount root RO → `fsck -y` (auto-yes, no prompt) → if MODIFIED, `reboot -n`
 → only mount RW + clear FSACTIVE after a clean pass. Fix the FSACTIVE-stamp ordering + no-sync reboot
 so it repairs once and proceeds — no loop, no manual fsck.
+
+## 2026-07-11: two load-bearing contracts (T2.P3) — the spl6 bracket + the addr-is-physical rule
+
+Two facts that must not be relitigated. Both came out of the T2.P3 CD-read-completion
+corruption investigation (`docs/t2p3-artifacts/` in the Amix workspace: the WILD
+exception-frame capture `p0.1-serial-log-findings.md`, the disassembly verdict
+`p0.2-callout-ipl-verdict.md`).
+
+### (a) `sdcom.addr` is a PHYSICAL address by contract — do NOT add vtop() in z3660.c
+
+`cp->addr` reaching `z3660queue()` is **already a bus/physical address**: every caller
+translates before filling it. The stock disk path does it at `amiga/alien/dd.c:240`
+(`dp->com.addr = (caddr_t)vtop(bp->b_un.b_addr, bp->b_proc);`), and the cdfs kernel
+transport does it at `amix-cdfs/platform/amix-kernel/amix_kern_media.c:151`
+(`req.sc.addr = (caddr_t)vtop(data, (struct proc *)0);`). The driver therefore stores
+`cp->addr` straight into `WRITE_ADDR3`/`READ_ADDR3` (and its `< 0x08000000` bounce gate
+tests that physical value) — correct as written.
+
+Adding a `vtop()` **inside** z3660.c would translate an already-translated address —
+double translation — pointing the firmware DMA at garbage. This "fix" was proposed and
+**evaluated on 2026-07-11 as a NON-FIX; do not resurrect it.** (The genuine T2.P3
+corruption was the callout re-entrancy in (b), not addressing.)
+
+Host-harness note: under `HOST_TEST` `vtop()` is effectively identity — the test stores
+the raw host buffer pointer in `cp->addr` and the mock passes it through unmapped (register
+cells are `unsigned long` so a 64-bit pointer survives the `*_ADDR3` slot).
+
+### (b) callout-IPL: why z3660queue() now brackets the whole transaction with spl6/splx
+
+Stock-kernel disassembly (verdict doc) established:
+
+- `timeout()` **callouts are dispatched at SR 0x2400 = IPL 4**, from `timein()`.
+- The **sole trigger** of that dispatcher is the **CIA-A clock at 68k level 2** (Paula
+  AIEINT2 → p2int → aciaaintr → clock_int → clock() → timepoke() → timein()). So a
+  section masked to **spl2 (SR 0x2200) already blocks the trigger** — which is why the
+  cdfs transport's `sdspl`=spl2 sections (and `sd.h`'s `sdspl`) are sound.
+- **But z3660.c itself previously had ZERO spl masking** (the only spl-ish tokens were the
+  two `timeout()` calls). Its synchronous mailbox transaction — the shared `DRVNUMX` /
+  `*_ADDR1..3` / bounce register sequence — ran at whatever IPL the caller held, **often
+  spl0**. A level-2 clock tick mid-transaction dispatches `z3660done` at IPL 4 →
+  `ihandle → startio` → a **full nested mailbox transaction inside the in-flight one** →
+  scrambled registers / stale bounce → firmware DMA to the wrong address. That is exactly
+  the corrupt-exception-frame state the 0.1 WILD capture recorded (user resumed at
+  kernel-text PC 0x3FC5C after CD read #1 completion).
+
+**Fix (shipped here):** bracket the ENTIRE `z3660queue()` transaction — register setup,
+the synchronous command trigger, and every status readout — plus the `z3660present()`
+probe, with `s = spl6(); … splx(s);` (via `z3660_enter()`/`z3660_leave()`). spl6 raises to
+IPL 4, masking the level-2 clock with margin, so a clock-driven completion can never nest a
+second transaction inside an in-flight one. The `timeout()` completion calls are unchanged
+(they only schedule the callout; the callback runs later from clock context, now serialized
+by the bracket). z3660.c now `#include "sys/inline.h"` for spl6/splx, exactly like
+`amiga/floppy/flop.c` and `amiga/driver/hd.c`.
+
+**Header quirk (do not be surprised):** in `sys/inline.h` on this platform `spl5`, `spl6`,
+and `spl7` are **all** `#define`d to `_spl4`, which emits `move.w #0x2400,%sr` — i.e. "spl6"
+in Amix kernel source is really IPL 4, not IPL 6. That is fine here: the clock is CIA-A at
+level 2, well below 4. (CIA-B at level 6 would *not* be masked by these macros — irrelevant
+while the clock trigger is CIA-A.)
+
+**Permanent reentrancy detector (production, kmem-readable):** two non-static globals ride
+the bracket — `z3660_nest_depth` (current transaction nesting depth) and `z3660_nest_hits`
+(count of transactions entered while another was already in flight). `z3660_enter()` bumps
+depth and, if depth was already nonzero, bumps hits; `z3660_leave()` drops depth. On a
+correctly bracketed kernel **`z3660_nest_hits` stays 0 forever**; a nonzero value read via
+`/dev/kmem` is direct proof the guard was breached. The accounting is a couple of cheap
+instructions and stays in the shipping driver.
+
+Regression coverage: `test/host/` gained mock `spl6()`/`splx()` (a mock IPL + counters, in
+`kstubs.c`) and a mid-transaction re-entry test (`z3660_test.c` `test_reentry()`) that fires
+a simulated clock callout from inside the in-flight mailbox command. With the bracket the
+nested attempt is deferred (`z3660_nest_hits == 0`, outer read data intact); with the bracket
+artificially removed (`mock_spl_disabled`) the nested transaction interleaves and
+`z3660_nest_hits` counts it. All prior gating assertions plus the CD-oracle parity table
+stay green (45/45 gating, 6/6 parity).

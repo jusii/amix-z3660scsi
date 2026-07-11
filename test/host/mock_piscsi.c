@@ -86,6 +86,21 @@ static unsigned long  used_dma;
 static unsigned char *g_bounce;       /* board+0x80000 mirror; shared w/ driver */
 static unsigned char  g_regs[64];     /* dummy non-NULL register window        */
 
+/*
+ * In-flight hook.  Fired from inside do_read()/do_write() -- the synchronous
+ * window where the real ARM is servicing the command and the driver is holding
+ * the mailbox registers.  The re-entry test registers a hook here to simulate a
+ * clock callout landing mid-transaction; NULL (the default) means no test is
+ * watching, so every existing test is unaffected.
+ */
+static void (*g_inflight_hook)();
+
+void mock_set_inflight_hook( fn)
+void	(*fn)();
+{
+	g_inflight_hook = fn;
+}
+
 /* -------- board seams the driver externs (resolved here) ---------------- */
 
 /*
@@ -127,6 +142,12 @@ unsigned long	drive;
 	mock_dev	*d;
 	unsigned long	block, len, off, n;
 
+	/* in-flight window: a clock callout may try to nest here (re-entry test).
+	 * Fired BEFORE latching the mailbox registers so a nested transaction that
+	 * is NOT blocked clobbers them and the interleave is observable. */
+	if (g_inflight_hook)
+		g_inflight_hook();
+
 	used_dma = 0;
 	if (drive >= MOCK_UNITS)
 		return;
@@ -156,6 +177,9 @@ unsigned long	drive;
 	mock_dev	*d;
 	unsigned long	block, len, off, n;
 	unsigned char	*src;
+
+	if (g_inflight_hook)		/* in-flight window (see do_read) */
+		g_inflight_hook();
 
 	used_dma = 0;
 	if (drive >= MOCK_UNITS)
@@ -252,6 +276,8 @@ void mock_reset()
 	memset( u32_read,  0, sizeof u32_read);
 	memset( u32_write, 0, sizeof u32_write);
 	used_dma = 0;
+	g_inflight_hook = 0;
+	mock_spl_reset();
 	if (!g_bounce)
 		g_bounce = (unsigned char *)malloc( MOCK_BOUNCE);
 	memset( g_bounce, 0, MOCK_BOUNCE);

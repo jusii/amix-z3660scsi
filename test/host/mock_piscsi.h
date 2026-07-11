@@ -31,4 +31,23 @@ void  mock_add_drive(int unit, unsigned long pdt,
 unsigned char *mock_backing(int unit);      /* backing store pointer, or 0 */
 unsigned long  mock_backing_len(int unit);  /* backing store length         */
 
+/*
+ * Mock spl / re-entry harness (spl impl in kstubs.c, in-flight hook in
+ * mock_piscsi.c).  Models the driver's spl6()/splx() mailbox-transaction
+ * bracket and the simulated clock callout that tries to nest a second
+ * transaction inside an in-flight one.
+ */
+extern int  mock_spl_disabled;              /* set => spl6() is a no-op (bracket absent) */
+extern long mock_spl6_calls, mock_splx_calls;
+int  mock_clock_masked(void);               /* nonzero => level-2 clock masked (IPL>=4) */
+void mock_spl_reset(void);                  /* reset mock IPL + spl counters/knob        */
+
+/*
+ * Register an in-flight hook the mailbox fires from inside a READ/WRITE command
+ * (the synchronous "ARM is busy" window) -- the seam the re-entry test uses to
+ * simulate a clock tick landing mid-transaction.  Pass 0 to clear.  Reset by
+ * mock_reset().
+ */
+void mock_set_inflight_hook(void (*fn)());
+
 #endif

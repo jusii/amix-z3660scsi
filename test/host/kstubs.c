@@ -9,6 +9,54 @@
  * would read 64 bits where the caller passed 32).  bcopy is a plain byte loop
  * to sidestep the clash.
  */
+#include "mock_piscsi.h"
+
+/*
+ * Mock spl (interrupt priority level).  The real amiga inline.h emits
+ * `move.w #0x2400,%sr` for spl6 (IPL 4) and restores the SR word for splx; here
+ * we model just the level.  spl6() raises the mock IPL to 4 and returns the
+ * prior level as the restore token; splx() puts it back.  mock_spl_disabled is
+ * the re-entry test's knob: with it set, spl6() is a no-op so the driver's
+ * bracket is "artificially absent" and the simulated clock callout is no longer
+ * masked.  mock_clock_masked() reports whether the CIA-A level-2 clock (the sole
+ * trigger of timeout() callout dispatch) would be masked at the current level.
+ */
+int  mock_ipl;			/* current mock interrupt priority level        */
+int  mock_spl_disabled;		/* test knob: when set, spl6() does not raise   */
+long mock_spl6_calls;		/* count of spl6() calls (observability)        */
+long mock_splx_calls;		/* count of splx() calls                        */
+
+int spl6()
+{
+	int	old;
+
+	old = mock_ipl;
+	mock_spl6_calls++;
+	if (!mock_spl_disabled)
+		mock_ipl = 4;		/* _spl4: 0x2400 => IPL 4 */
+	return old;
+}
+
+int splx( s)
+int	s;
+{
+	mock_splx_calls++;
+	mock_ipl = s;
+	return 0;
+}
+
+int mock_clock_masked()
+{
+	return mock_ipl >= 4;		/* CIA-A level-2 clock masked at IPL >= 4 */
+}
+
+void mock_spl_reset()
+{
+	mock_ipl = 0;
+	mock_spl_disabled = 0;
+	mock_spl6_calls = 0;
+	mock_splx_calls = 0;
+}
 
 /* SVR4 bcopy: source first, destination second (opposite of memcpy). */
 void bcopy( src, dst, n)

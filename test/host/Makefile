@@ -26,7 +26,8 @@ all: $(BIN)
 
 # The driver: kernel include world + register seam + HOST_TEST.
 $(BUILD)/z3660.o: $(DRV) mock_regs.h stubs/rico.h stubs/sd.h \
-                  stubs/sys/types.h stubs/sys/immu.h stubs/sys/errno.h
+                  stubs/sys/types.h stubs/sys/immu.h stubs/sys/errno.h \
+                  stubs/sys/inline.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DHOST_TEST -Istubs -include mock_regs.h -c $(DRV) -o $@
 

@@ -54,6 +54,10 @@
 #include	"sys/types.h"
 #include	"sys/immu.h"		/* PG_V, phystopfn, paddr_t */
 #include	"sys/errno.h"
+#include	"sys/inline.h"		/* spl6()/splx(): the mailbox-transaction bracket
+					 * (spl6 => _spl4 => move.w #0x2400,%sr, IPL 4).
+					 * Included like flop.c/hd.c; under HOST_TEST it
+					 * resolves to test/host/stubs/sys/inline.h. */
 #include	"rico.h"
 #include	"sd.h"
 
@@ -132,6 +136,46 @@ uchar	z3660_rc, z3660_lastcmd, z3660_present;
 static uchar	z3660_sense_key, z3660_sense_asc, z3660_sense_ascq;
 
 /*
+ * Permanent mailbox-transaction reentrancy detector (production; both counters
+ * are non-static so a userland tool can read them via /dev/kmem).  Every
+ * synchronous piscsi transaction is bracketed by z3660_enter()/z3660_leave():
+ *
+ *   z3660_enter() raises to spl6 -- masking the CIA-A level-2 clock interrupt
+ *   that is the SOLE trigger of timeout() callout dispatch (see NOTES.md
+ *   "callout-IPL"), so a clock-driven completion can never dispatch z3660done ->
+ *   ihandle -> startio -> a NESTED mailbox transaction inside an in-flight one --
+ *   then bumps z3660_nest_depth.
+ *
+ *   z3660_leave() drops the depth and restores the caller's IPL.
+ *
+ * If a transaction is ever entered while another is still in flight
+ * (z3660_nest_depth != 0) z3660_nest_hits is bumped.  With the bracket in place
+ * that must stay 0 forever; a nonzero z3660_nest_hits is proof the guard was
+ * breached.  The accounting is a couple of cheap, branch-light instructions and
+ * stays in the shipping driver.
+ */
+ulong	z3660_nest_depth, z3660_nest_hits;
+
+static int
+z3660_enter()
+{
+	int	s;
+
+	s = spl6();				/* mask the clock; token = prior IPL */
+	z3660_nest_hits += (z3660_nest_depth != 0);
+	z3660_nest_depth++;
+	return s;
+}
+
+static void
+z3660_leave( s)
+int	s;
+{
+	z3660_nest_depth--;
+	splx( s);				/* restore the caller's IPL */
+}
+
+/*
  * Map the register window and the bounce buffer into kernel VA and verify the
  * mailbox answers.  0 on success; ENXIO when no Z3660 is present.
  *
@@ -186,7 +230,12 @@ int
 z3660present( ap)
 char	**ap;
 {
-	if (z3660map())
+	int	r, s;
+
+	s = z3660_enter();		/* the probe issues a mailbox register sequence */
+	r = z3660map();
+	z3660_leave( s);
+	if (r)
 		return 0;
 	*ap = (char *)board_phys;
 	return 1;
@@ -298,14 +347,25 @@ z3660queue( c, cp)
 int		c;
 struct sdcom	*cp;
 {
-	int	e, i, unit, write;
+	int	e, i, unit, write, s;
 	ulong	block, blocks, bs, nb, pdt;
 	uchar	*data;
 	uchar	op;
 
+	/*
+	 * Bracket the ENTIRE transaction -- register setup, the synchronous
+	 * command trigger, and every status readout -- at spl6.  This is the one
+	 * spl in the driver; without it a clock tick mid-transaction dispatches a
+	 * nested z3660queue() that scrambles the shared mailbox registers of the
+	 * in-flight op (see NOTES.md "callout-IPL").  z3660map() and the geometry/
+	 * rw helpers all run inside this bracket.
+	 */
+	s = z3660_enter();
+
 	if (e = z3660map()) {
 		cp->status = 0xff; cp->okay = FALSE;
 		timeout( z3660done, (caddr_t)cp, 1);
+		z3660_leave( s);
 		return TRUE;
 	}
 
@@ -489,6 +549,7 @@ struct sdcom	*cp;
 
 	z3660_rc = cp->okay ? 0 : 0xff;
 	timeout( z3660done, (caddr_t)cp, 1);
+	z3660_leave( s);
 	return TRUE;
 }
 
