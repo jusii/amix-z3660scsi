@@ -110,7 +110,6 @@ extern int	autocon();
 extern caddr_t	sptalloc();
 extern void	bcopy();
 extern int	printf();
-extern int	timeout();
 
 static volatile uchar	*regs;		/* board+0x2000 register window  */
 static volatile uchar	*bounce;	/* board+0x80000 bounce buffer   */
@@ -323,18 +322,98 @@ uchar	*data;
 }
 
 /*
- * Deferred completion: the piscsi op itself is synchronous, but calling
- * cp->intr inline from inside the sdqueue/ddstrategy call chain recurses
- * dd.c's ihandle->iodone->b_iodone->ddstrategy loop one kernel stack frame
- * per chunk (stack death on the first big multi-chunk burst -- observed on
- * real HW at the cylinder-group write burst ~100 I/Os into boot).  Complete
- * from clock context via timeout() instead, like a real interrupt HBA.
+ * Completion worker: run cp->intr(cp).  Invoked by z3660_complete()'s drain
+ * loop (below), NOT inline from the sdqueue/ddstrategy call chain and NOT from a
+ * clock callout.  The piscsi op itself is synchronous; the only reason
+ * completion is not a bare inline (*cp->intr)(cp) is that dd.c's disk completion
+ * re-issues the next I/O (ihandle -> startio -> sdqueue -> z3660queue), which
+ * would recurse one kernel-stack frame per chunk (stack death on the first big
+ * multi-chunk burst -- observed on real HW ~100 I/Os into boot).  z3660_complete()
+ * flattens that recursion; see its comment for the full lifetime rationale (why a
+ * timeout()-deferred cp is fatal on the cdfs CD-read path).
  */
 static void
 z3660done( cp)
 struct sdcom	*cp;
 {
 	(*cp->intr)( cp);
+}
+
+/*
+ * Synchronous, iterative completion delivery.
+ *
+ * The piscsi op is synchronous, so the request is finished by the time
+ * z3660queue() gets here -- the completion MUST be delivered while the caller's
+ * context is still current, because the caller's `cp` (sdcom) may live on the
+ * caller's PER-PROCESS kernel stack.  It does on the cdfs CD-read path: the
+ * in-kernel media backend (../amix-cdfs platform/amix-kernel/amix_kern_media.c,
+ * amix_kern_submit) declares `amix_kern_req_t req;` on the stack, hands sdqueue
+ * `&req.sc`, and blocks in sleep() until the completion fires.  sdqueue() is a
+ * bare pass-through (scsi.c: (*queue[card].f)(c, cp)), so that stack address is
+ * exactly the `cp` reaching us.
+ *
+ * The old code deferred completion to a clock (IPL4) callout --
+ * timeout(z3660done, cp, 1) -- purely to break dd.c's completion->re-issue
+ * recursion.  That is safe ONLY for a persistent cp: the disk path passes
+ * &dp->com (a global in ddtab[][], mapped identically in every context) and
+ * gsioctl a static sdcom.  For the cdfs stack cp it is fatal: the callout fires
+ * ~1 tick later from whatever process is current (the caller is asleep, usually
+ * switched out), and a per-process kernel-stack VA (~0x40001xxx, the u-area
+ * window) then resolves into a DIFFERENT process's stack -- so z3660done reads a
+ * garbage cp->intr (run-to-run "variable garbage", varying pid) and jumps
+ * through it.  That is the T2.P3 mount panic: the corrupting completion is always
+ * a CD READ(10) (lastcmd=0x28) with cp on the stack, while every disk completion
+ * (persistent cp=0x80FDxxx) stays healthy.  depth==0/hits==0 -- not reentrancy,
+ * not a DMA scribble: a pointer-lifetime bug in the deferred completion.
+ *
+ * Fix: deliver synchronously here, before z3660queue() returns, so cp is always
+ * dereferenced in the context that owns it.  To keep dd.c's disk burst from
+ * recursing (the sole reason timeout() ever existed), a small driver-owned FIFO
+ * plus a `completing` guard flattens it: the first completion runs the drain
+ * loop; a completion re-issued from inside an intr() (ihandle -> startio ->
+ * sdqueue -> z3660queue -> here) merely appends to the FIFO and returns, and the
+ * loop picks it up.  So the multi-chunk burst is delivered iteratively at a
+ * fixed, small stack depth -- never one frame per I/O.  spl6 brackets only the
+ * O(1) FIFO bookkeeping (serializing it against a clock-callout-driven re-issue);
+ * the intr() call itself runs at the caller's IPL, exactly as before.
+ */
+#define	Z3660_CQ	32		/* completion FIFO depth (power of 2)          */
+static struct sdcom	*z3660_cq[Z3660_CQ];
+static uint		z3660_cq_head, z3660_cq_tail;
+static int		z3660_completing;
+ulong			z3660_cq_overflow;	/* kmem-readable: FIFO overrun count   */
+
+static void
+z3660_complete( cp)
+struct sdcom	*cp;
+{
+	struct sdcom	*p;
+	uint		nt;
+	int		s;
+
+	s = spl6();			/* serialize the FIFO vs a callout-driven re-issue */
+	nt = (z3660_cq_tail + 1) & (Z3660_CQ - 1);
+	if (nt == z3660_cq_head) {
+		z3660_cq_overflow++;	/* full -- must never happen (see Z3660_CQ sizing) */
+		splx( s);
+		return;
+	}
+	z3660_cq[z3660_cq_tail] = cp;
+	z3660_cq_tail = nt;
+	if (z3660_completing) {		/* an outer drain loop already owns delivery */
+		splx( s);
+		return;
+	}
+	z3660_completing = 1;
+	while (z3660_cq_head != z3660_cq_tail) {
+		p = z3660_cq[z3660_cq_head];
+		z3660_cq_head = (z3660_cq_head + 1) & (Z3660_CQ - 1);
+		splx( s);		/* run the completion at the caller's IPL */
+		z3660done( p);		/* (*p->intr)(p); may re-enter here */
+		s = spl6();
+	}
+	z3660_completing = 0;
+	splx( s);
 }
 
 /*
@@ -364,8 +443,8 @@ struct sdcom	*cp;
 
 	if (e = z3660map()) {
 		cp->status = 0xff; cp->okay = FALSE;
-		timeout( z3660done, (caddr_t)cp, 1);
 		z3660_leave( s);
+		z3660_complete( cp);		/* deliver OUTSIDE the mailbox bracket */
 		return TRUE;
 	}
 
@@ -548,8 +627,8 @@ struct sdcom	*cp;
 	}
 
 	z3660_rc = cp->okay ? 0 : 0xff;
-	timeout( z3660done, (caddr_t)cp, 1);
 	z3660_leave( s);
+	z3660_complete( cp);			/* deliver OUTSIDE the mailbox bracket */
 	return TRUE;
 }
 

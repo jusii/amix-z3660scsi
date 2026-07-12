@@ -405,3 +405,71 @@ nested attempt is deferred (`z3660_nest_hits == 0`, outer read data intact); wit
 artificially removed (`mock_spl_disabled`) the nested transaction interleaves and
 `z3660_nest_hits` counts it. All prior gating assertions plus the CD-oracle parity table
 stay green (45/45 gating, 6/6 parity).
+
+## 2026-07-12: T2.P3 mount panic — completion pointer-lifetime bug (the CD-read `cp`)
+
+The spl6 bracket (908f40a) killed the register-scramble but the `mount -F cdfs` still
+panicked, one CD read past where progress used to stop. On-box `cmn_err` capture (diag
+kernel 0fe0e2e, `docs/t2p3-artifacts/p3-mount-panic-analysis.md` "SMOKING GUN"):
+
+```
+z3660done BAD intr: cp=0x40001C58 intr=0x40000730 unit=... addr=0x0 lastcmd=0x28 depth=0 hits=0
+```
+
+**Root cause — mechanism (a): the caller passes a transient, PER-PROCESS-STACK `sdcom`,
+and the `timeout()`-deferred completion dereferences it out of context.** Not reentrancy
+(`depth=0 hits=0`, spl6 sound), not a DMA scribble (the *pointer itself* is bad, not its
+target). Evidence chain, all from source:
+
+- The cdfs in-kernel media backend `amix-cdfs/platform/amix-kernel/amix_kern_media.c`
+  `amix_kern_submit()` declares the request **on its stack** — `amix_kern_req_t req;`
+  (`struct sdcom sc` first member) — fills `&req.sc`, calls `sdqueue(&req.sc)`, then blocks
+  in `sleep()` until the driver's completion sets `req.done`. That is the *only* CD-read
+  path (cdfs `vop_getpage` is `fs_nosys`; all CD I/O flows through this backend).
+- `sd.c:sdqueue()` is a bare pass-through — `(*queue[cp->card].f)(c, cp)` — so `&req.sc`
+  reaches `z3660queue()` unchanged, and is the `cp` handed to `timeout(z3660done, cp, 1)`.
+- The disk path is immune because its `cp` is **persistent**: `dd.c` passes `&dp->com`
+  (a global in `ddtab[][]`, mapped identically in every context) and `scsi.c:gsioctl` a
+  `static struct sdcom`. Baseline capture confirms the disk completion `cp=0x80FDxxx`,
+  `intr=0x800BF02` (kernel text) — always valid.
+- `timeout(...,1)` fires `z3660done` ~1 tick later **from a clock (IPL4) callout, in the
+  context of whatever process is current** (capture shows the pid varying: flopd / fsflush /
+  pid 3 — "just whoever is current"). The cdfs caller is asleep and usually switched out, so
+  its per-process kernel-stack VA (`~0x40001xxx`, the fixed u-area window) now resolves into
+  a *different* process's stack. `z3660done` then reads a garbage `cp->intr` (hence the
+  run-to-run "variable garbage": `0xFF000000`, `0x7E`, `0x40000730`) and jumps through it →
+  KERNEL FAULT. A few CD sectors read cleanly first only because early completions happen to
+  land while the caller is still current; once it context-switches out, the next callout
+  dies.
+
+**Fix (this driver, `src/z3660.c`): deliver the completion SYNCHRONOUSLY and ITERATIVELY —
+no `timeout()`, no deferral window.** `z3660queue()` now calls a new `z3660_complete(cp)`
+right after `z3660_leave()` (outside the mailbox bracket) instead of scheduling a callout.
+Because the piscsi op is already finished, the completion runs *before z3660queue returns*,
+in the caller's own context, so a per-process-stack `cp` is always valid. The *only* reason
+`timeout()` existed — breaking `dd.c`'s completion→re-issue recursion (`ihandle → startio →
+sdqueue → z3660queue`, one stack frame per chunk, stack-death on big bursts) — is preserved
+by a driver-owned completion FIFO + a `z3660_completing` guard: the first completion runs a
+drain loop; any completion re-issued from inside an `intr()` merely appends to the FIFO and
+returns, and the loop picks it up. So the disk burst is delivered iteratively at a fixed,
+small stack depth (host test measures depth 1 over a 51-deep re-issue chain), never one
+frame per I/O. `spl6` brackets only the O(1) FIFO bookkeeping (against a clock-callout-driven
+re-issue); the `intr()` call runs at the caller's IPL exactly as the callout used to.
+`z3660_cq_overflow` is a kmem-readable guard counter (must stay 0). `z3660done` is now the FIFO
+drain loop's worker — a bare `(*cp->intr)(cp)` (the temporary BAD-intr trap that caught this bug
+on the bench was removed once the fix was proven on metal).
+
+Why both paths stay correct: disk/gsioctl completions were already delivered correctly by a
+persistent `cp`; they now run synchronously (a synchronous mailbox device has no async
+benefit) and iteratively, so no recursion. The cdfs completion now runs in-context, so its
+stack `cp` is live. The fix was proven on metal with the temporary BAD-intr trap still active
+(diag kernel 5a46562): the "z3660done BAD intr" line never fired and the mount proceeded past
+the CD reads. Those bench diagnostics have since been stripped; the permanent guards
+`z3660_cq_overflow` and `z3660_nest_hits` must stay 0 on the shipping driver.
+
+Regression coverage added: `test/host/z3660_test.c` `test_completion_trampoline()` drives a
+50-deep re-issue chain through a persistent `sdcom` (mimicking `dd.c`'s `&dp->com` + `ihandle`)
+and asserts all 51 completions are delivered, `max_depth <= 2` (iterative, not per-I/O
+recursion), FIFO never overran, and no mailbox re-entry. Host harness now 49/49 gating, 6/6
+parity. Kernel path cross-compiles clean (`m68k-cbm-sysv4-gcc -O -c`); the object's
+undefined-symbol set drops `timeout` and gains nothing.

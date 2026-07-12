@@ -470,6 +470,69 @@ static void test_reentry()
 }
 
 /* ====================================================================== */
+/* GATING: synchronous ITERATIVE completion (the T2.P3 lifetime fix).       */
+/* A completion that re-issues the next I/O -- exactly dd.c's ihandle ->     */
+/* startio -> sdqueue -> z3660queue chain -- must (1) be delivered while the */
+/* caller's context is current (no timeout() deferral window that strands a  */
+/* stack sdcom) and (2) NOT recurse one kernel-stack frame per I/O.  This    */
+/* drives a long re-issue chain through a PERSISTENT sdcom (like &dp->com)   */
+/* and asserts every completion lands at a fixed, small nesting depth.       */
+/* ====================================================================== */
+
+extern unsigned long z3660_cq_overflow;	/* driver: completion-FIFO overrun count */
+
+static void		tramp_reissue();
+static struct sdcom	tramp_sc;	/* persistent -- mimics dd.c's &dp->com   */
+static int		tramp_depth, tramp_max_depth, tramp_deliveries, tramp_chain;
+
+static void tramp_intr( cp)
+struct sdcom	*cp;
+{
+	tramp_depth++;
+	if (tramp_depth > tramp_max_depth)
+		tramp_max_depth = tramp_depth;
+	tramp_deliveries++;
+	if (tramp_chain > 0) {			/* re-issue the next op, like ihandle */
+		tramp_chain--;
+		tramp_reissue( (int)cp->unit);
+	}
+	tramp_depth--;
+}
+
+static void tramp_reissue( unit)
+int	unit;
+{
+	memset( &tramp_sc, 0, sizeof tramp_sc);
+	tramp_sc.unit   = (uint)unit;
+	tramp_sc.cdb[0] = 0x00;			/* TEST UNIT READY: no data, always GOOD */
+	tramp_sc.intr   = (void (*)())tramp_intr;
+	z3660queue( unit, &tramp_sc);
+}
+
+static void test_completion_trampoline()
+{
+	printf("\n=== GATE: synchronous iterative completion (no per-I/O recursion) ===\n");
+
+	z3660_nest_depth = z3660_nest_hits = 0;
+	z3660_cq_overflow = 0;
+	tramp_depth = tramp_max_depth = tramp_deliveries = 0;
+	tramp_chain = 50;			/* initial completion + 50 re-issues = 51 */
+
+	tramp_reissue( U_DISK);			/* kick off the re-issue chain */
+
+	printf("       deliveries=%d max_depth=%d nest_hits=%lu cq_overflow=%lu\n",
+	       tramp_deliveries, tramp_max_depth, z3660_nest_hits, z3660_cq_overflow);
+	CHECK( tramp_deliveries == 51,
+	       "trampoline: all 51 chained completions delivered (none stranded)");
+	CHECK( tramp_max_depth <= 2,
+	       "trampoline: completion depth bounded (iterative, not per-I/O recursion)");
+	CHECK( z3660_cq_overflow == 0, "trampoline: completion FIFO never overran");
+	CHECK( z3660_nest_hits == 0, "trampoline: no mailbox re-entry across the burst");
+
+	z3660_nest_depth = z3660_nest_hits = 0;
+}
+
+/* ====================================================================== */
 int main()
 {
 	mock_reset();
@@ -491,6 +554,7 @@ int main()
 	test_tur_both();
 
 	test_reentry();
+	test_completion_trampoline();
 
 	stretch_cd_parity();
 
