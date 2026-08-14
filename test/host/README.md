@@ -30,6 +30,8 @@ Gating (mount-critical, gate the exit code):
   behavior **frozen** as the current driver emits it (the real box boots on
   this path; the oracle's disk strings do *not* apply here).
 - TEST UNIT READY GOOD for both.
+- Board mapping: `z3660map()` takes the **direct** (section-0 identity) arm and
+  calls no `sptalloc()` — see below.
 
 Stretch (reported, never gated): a parity table of the driver against the CD
 half of the firmware oracle
@@ -57,3 +59,23 @@ physical address from `vtop()`. Under `HOST_TEST` `vtop()` is identity (the
 caller stores the buffer pointer straight into `cp->addr`) and the mock passes
 that host pointer through unmapped — register cells are `unsigned long` so a
 64-bit pointer survives the `*_ADDR3` slot (LP64 hosts only).
+
+## Board mapping: the harness exercises the arm the metal box runs
+
+`z3660map()` has two arms. Below `VSECT1` (`0x40000000`) the board's physical
+address already *is* a valid supervisor VA — AMIX identity-maps the low 1 GB
+through a section-0 early-termination descriptor — so the driver dereferences it
+and calls nothing; at or above `VSECT1` it falls back to `sptalloc()`. The
+shipped config (`autoconfig_rtg NO`, fixed base `0x10000000`) takes the direct
+arm, and `mock_piscsi.c`'s `autocon()` reports that same base, so **the harness
+tests the shipping path**.
+
+The host has no identity map, so `phystokv()` is routed through the mock
+(`z3660_mock_phystokv()` in `mock_piscsi.c`, wired in `stubs/sys/immu.h`) and
+returns the same `g_regs`/`g_bounce` buffers the `sptalloc()` stub returns. Both
+arms therefore land on the mock's buffers — which is exactly why
+`test_direct_mapping()` gates on the driver's `z3660_direct_map` flag: without
+it, a regression that silently reverted to `sptalloc()` would leave every other
+test passing. Moving `MOCK_BOARD_BASE` to `0x40000000` flips the flag and fails
+that one gate while the other 51 still pass, which is also how the retained
+high-base arm stays proven.

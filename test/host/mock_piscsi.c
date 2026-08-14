@@ -104,10 +104,41 @@ void	(*fn)();
 /* -------- board seams the driver externs (resolved here) ---------------- */
 
 /*
- * sptalloc(): the driver maps two windows -- the 1-page register window and the
- * BOUNCE_PAGES bounce buffer.  We hand back g_regs for the former (the WRLONG/
- * RDLONG overrides ignore the returned pointer) and g_bounce for the latter, so
- * the driver's `bounce` IS the buffer do_read()/do_write() move data through.
+ * The driver maps two BOARD windows -- the 1-page register window at
+ * board+0x2000 and the 64 KB firmware bounce staging area at board+0x80000.
+ * Both stubs below resolve to g_regs and g_bounce respectively, so the driver's
+ * `bounce` IS the buffer do_read()/do_write() move data through (the WRLONG/
+ * RDLONG overrides ignore whatever `regs` ends up pointing at).
+ *
+ * phystokv(): the DIRECT arm, and the one the shipped metal config takes -- the
+ * board base 0x10000000 is below VSECT1, inside AMIX's identity-mapped section
+ * 0, so z3660map() just dereferences the physical address and calls nothing.
+ * The host has no such identity map, so we translate the board-relative offset
+ * into the matching mock buffer.  An unrecognised offset returns 0, which makes
+ * z3660map() fail with ENOMEM rather than silently hand the driver the wrong
+ * buffer -- so a future offset change surfaces as a test failure.
+ */
+#define MOCK_BOARD_BASE  0x10000000UL	/* what autocon() below reports */
+#define MOCK_REGS_OFF    0x00002000UL	/* z3660.c PISCSI_OFFSET */
+#define MOCK_BOUNCE_OFF  0x00080000UL	/* z3660.c BOUNCE_OFFSET */
+
+unsigned long z3660_mock_phystokv( paddr)
+unsigned long	paddr;
+{
+	unsigned long	off = paddr - MOCK_BOARD_BASE;
+
+	if (off == MOCK_REGS_OFF)
+		return (unsigned long)g_regs;
+	if (off == MOCK_BOUNCE_OFF)
+		return (unsigned long)g_bounce;
+	return 0UL;
+}
+
+/*
+ * sptalloc(): the arm kept for a board at or above VSECT1 (autoconfig_rtg YES).
+ * Unreachable at the base autocon() reports, but resolved so the driver links
+ * and so a base change re-exercises it: 1 page = the register window, more = the
+ * bounce.
  */
 char *sptalloc( npages, flags, pfn, dummy)
 int		npages;
@@ -120,16 +151,16 @@ int		dummy;
 }
 
 /*
- * autocon(): report the board found, at a fixed base.  Returning non-zero makes
- * z3660map() take the happy path and skip the VPOSR ($DFF004) hardware probe,
- * which would segfault on the host.
+ * autocon(): report the board found, at the shipped fixed base.  Returning
+ * non-zero makes z3660map() take the happy path and skip the VPOSR ($DFF004)
+ * hardware probe, which would segfault on the host.
  */
 int autocon( prod, idx, basep, sizep)
 long	prod;
 int	idx;
 long	*basep, *sizep;
 {
-	*basep = 0x10000000L;
+	*basep = (long)MOCK_BOARD_BASE;
 	*sizep = 0x00100000L;
 	return 1;
 }

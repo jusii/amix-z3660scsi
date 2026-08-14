@@ -27,6 +27,12 @@ extern bool z3660queue();		/* bool == char (rico.h); K&R decl */
 /* permanent reentrancy counters exported by the driver (kmem-readable on HW) */
 extern unsigned long z3660_nest_depth, z3660_nest_hits;
 
+/* which mapping arm z3660map() took: 1 = section-0 identity, 0 = sptalloc'd */
+extern unsigned char z3660_direct_map;
+
+extern int	z3660present();		/* sd.c probe hook (K&R decl) */
+static char	*g_probe_base;		/* board base z3660present() reports */
+
 /* CD units on this mock bus: 6 = CD-ROM (also the detection-probe unit), 0 = disk. */
 #define U_CD	6
 #define U_DISK	0
@@ -103,6 +109,33 @@ int		n;
 	printf("       %s:", tag);
 	for (i = 0; i < n; i++) printf(" %02X", b[i]);
 	printf("\n");
+}
+
+/* ====================================================================== */
+/* GATING: which mapping arm ran.                                          */
+/* ====================================================================== */
+
+/*
+ * The shipped Z3660 config (autoconfig_rtg NO) puts the board at the fixed base
+ * 0x10000000 -- below VSECT1, inside AMIX's identity-mapped section 0 -- so
+ * z3660map() must take the DIRECT arm and call no sptalloc() at all.  The mock's
+ * autocon() reports exactly that base, so the arm the harness exercises is the
+ * arm the metal box runs.  This gate exists so that stays true: if the threshold,
+ * the window span, or the mock base ever drifts such that the driver falls back
+ * to sptalloc(), every other test would still pass (both arms reach the same mock
+ * buffers) and the regression would be invisible.  Run it first -- the CDB tests
+ * below all map the board as a side effect of their first command.
+ */
+static void test_direct_mapping()
+{
+	printf("[GATE] board mapped DIRECTLY (no sptalloc below VSECT1)\n");
+	CHECK( z3660_direct_map == 0,
+	       "z3660_direct_map is 0 before the board is mapped");
+	CHECK( z3660present( &g_probe_base) == 1, "z3660present() finds the board");
+	printf("       base=0x%08lX direct_map=%d\n",
+	       (unsigned long)g_probe_base, (int)z3660_direct_map);
+	CHECK( z3660_direct_map == 1,
+	       "z3660map() took the section-0 identity arm, not sptalloc()");
 }
 
 /* ====================================================================== */
@@ -540,6 +573,8 @@ int main()
 	mock_add_drive( U_DISK, 0x00, DK_BS, DK_NBLK, 256UL * DK_BS);   /* 128 KB backing */
 
 	printf("=== Z3660 SCSI host CDB test (real src/z3660.c, -DHOST_TEST) ===\n\n");
+
+	test_direct_mapping();
 
 	test_cd_inquiry();
 	test_cd_read_capacity();

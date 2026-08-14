@@ -473,3 +473,76 @@ and asserts all 51 completions are delivered, `max_depth <= 2` (iterative, not p
 recursion), FIFO never overran, and no mailbox re-entry. Host harness now 49/49 gating, 6/6
 parity. Kernel path cross-compiles clean (`m68k-cbm-sysv4-gcc -O -c`); the object's
 undefined-symbol set drops `timeout` and gains nothing.
+
+## 2026-08-14: the board is mapped DIRECTLY below VSECT1 — the sptalloc is gone
+
+`z3660map()` no longer calls `sptalloc()` on the metal box. Both windows it maps —
+the 0x2000 register window and the 0x80000 bounce window — are taken at their
+physical addresses when the whole span sits below `VSECT1` (`0x40000000`). The
+`sptalloc()` arm is kept, unchanged, for a board at or above `VSECT1`.
+
+**Why this is correct.** AMIX's supervisor root table has four level-A entries, one
+per 1 GB section (`tc_on` encodes TIA=2; built in `ml/exp` `pstart()`). Entry 0 —
+VA `0x00000000`–`0x3FFFFFFF` — is a single **early-termination page descriptor**
+with page address 0: a straight identity map of the whole low 1 GB, RAM or not.
+That is why `immu.h:348` defines `phystokv(p)` as `(p)`, why stock Amiga drivers
+just dereference their `autocon()` base, and why this driver's own AGA gate can
+read VPOSR at `0xDFF004` before it has mapped anything. Only section 1 (`VSECT1`)
+is page-table-backed, and section 1 is what `sptalloc()` hands out of.
+
+🔴 **Mechanism correction.** The story this file and the driver header used to tell —
+"same TT-gap-safe approach as the A4091" (see the 2026-06-07 *How it maps onto the
+Amix SCSI framework* §3 and *Open questions* §5, left as written) — was **wrong in
+its mechanism**. AMIX never enables transparent translation: `amiga/boot/copyit.s`
+`pmove`s **zero** into `%tt0`/`%tt1`, and `ttrap.s`'s `tt0_on` word `0x003F0143`
+has E=0 (its own comment reads "Disable"). Same `0x40000000` boundary, different
+mechanism. Nothing functional depended on the wrong story, and the cacheability
+conclusion is unchanged (section 0 carries CI clear, and the `sptalloc` path could
+never have been cache-inhibited either — this kernel has **no `PG_CI` bit at all**;
+`immu.h` defines only `PG_ADDR/PG_LOCK/PG_M/PG_REF/PG_W/PG_V`).
+
+**Why it matters.** `sptalloc()` draws from `sptmap`, a hardcoded 2048-page (4 MB)
+resource map that `page[]` — sized by presented RAM — is carved out of *first*, so
+its free runs shrink as RAM grows. That is what made the sibling `z3660eth`
+driver's 65-page mapping fail past ~83 MB of RAM, printing "no Z3660 ethernet
+found" for a board that was fully visible and whose SCSI half was serving the root
+filesystem at that moment (`amix-z3660net@b89c5d2`). This driver's 33 pages were
+sitting in the same budget for no reason.
+
+**Both windows go direct — including the bounce.** The bounce buffer is *not* memory
+this driver allocates for DMA staging, despite the name. It is the **firmware's own**
+staging area at a fixed board offset (`SCSI_NO_DMA_ADDRESS = RTG_BASE+0x80000`,
+`Z3660 src/memorymap.h`), which both sides address by that offset and which the
+driver only ever `bcopy()`s to and from. Its address is never `vtop()`'d and never
+handed to the firmware — `*_ADDR3` always carries the *caller's* buffer — so moving
+it from an `sptalloc`'d VA to its physical address is invisible to the datapath.
+Hence 33 pages freed, not 1:
+
+| mapping | pages | before | after (base `0x10000000`) |
+|---|---|---|---|
+| register window (`+0x2000`) | 1 | `sptalloc` | direct |
+| bounce window (`+0x80000`) | `BOUNCE_PAGES` = 32 | `sptalloc` | direct |
+| **total sptmap pages** | **33** | **33** | **0** |
+
+(Amix `NBPP` is 2048, so 32 pages = the 64 KB `MAXXFER` bounce.)
+
+The direct arm is gated on the **entire** span — `base + Z3660_WINDOW_TOP`, where
+`Z3660_WINDOW_TOP = BOUNCE_OFFSET + BOUNCE_PAGES*NBPP = 0x00090000` — so a board
+based just under the boundary takes the mapped path rather than running off the end
+of section 0. Highest direct-mapped base is therefore `0x3FF70000` (host-harness
+verified). New kmem-readable diagnostic `z3660_direct_map`: 1 = identity, 0 =
+`sptalloc`'d.
+
+This also makes explicit something the datapath already relied on: `cp->addr` is a
+physical address by contract (2026-07-11 §(a) above), and `z3660_rw()` both
+`bcopy()`s through it *and* hands it to the firmware unchanged — only the section-0
+identity makes that legal.
+
+**Host harness.** `stubs/sys/immu.h` now carries the real `VSECT1`/`NBPP` values and
+routes `phystokv()` into the mock, so the harness exercises the **direct** arm — the
+one metal runs — instead of a path the box never takes. New gate
+`test_direct_mapping()` asserts `z3660_direct_map == 1`, because both arms reach the
+same mock buffers and a silent fallback would otherwise leave every other test green.
+52/52 gating, 6/6 parity. Cross-compile clean; the object's undefined-symbol set is
+unchanged (`sptalloc` is still referenced by the retained high arm), so the `nm -u`
+clean gate is unaffected.

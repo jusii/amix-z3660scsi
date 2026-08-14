@@ -14,7 +14,12 @@
  * is multi-method, like the Hydra driver: try autocon() first, then -- only on
  * an AGA machine (VPOSR >= 0x22; the ECS build box must never touch it) -- probe
  * the fixed base directly and verify the mailbox answers (DRVTYPE reads 0/1).
- * Mapping uses sptalloc() exactly like the A4091 (TT-gap safe).
+ *
+ * BOTH windows this driver maps are BOARD apertures, not kernel RAM -- including
+ * the "bounce buffer", which is the FIRMWARE's own staging area seen through the
+ * Zorro window (SCSI_NO_DMA_ADDRESS = RTG_BASE+0x80000, Z3660 src/memorymap.h),
+ * never a DMA buffer this driver allocates.  So neither needs a mapping call at
+ * all when the board sits below VSECT1; see the mapping note above z3660map().
  *
  * Protocol (board_base-relative, all 32-bit MMIO):
  *   register window  = board_base + 0x2000  (commands written/read as longs at
@@ -69,6 +74,10 @@
 #define	BOUNCE_PAGES	32		/* 64KB bounce; Amix NBPP is 2KB, not 4KB! */
 #define	MAXXFER		65536		/* max bytes per piscsi op */
 #define	BOUNCE_THRESH	0x08000000	/* buffers below this are bounced by the ARM */
+#define	BOUNCE_SPAN	(BOUNCE_PAGES * NBPP)	/* 0x10000 == MAXXFER */
+/* highest board-relative byte this driver ever touches, +1 (the bounce top;
+ * the register window at PISCSI_OFFSET sits far below it) */
+#define	Z3660_WINDOW_TOP	(BOUNCE_OFFSET + BOUNCE_SPAN)	/* 0x00090000 */
 
 /* piscsi command-register offsets (added to the register-window base) */
 #define	P_WRITE		0x00		/* trigger block WRITE  (value = unit) */
@@ -125,6 +134,7 @@ static long		board_phys;
 /* last-transaction diagnostics (read via /dev/mem or a probe tool) */
 ulong	z3660_lastblock, z3660_lastlen, z3660_blocks0, z3660_dma;
 uchar	z3660_rc, z3660_lastcmd, z3660_present;
+uchar	z3660_direct_map;	/* 1 = section-0 identity, 0 = sptalloc'd */
 
 /*
  * Pending REQUEST SENSE data for the next C_REQ_SENSE.  A zero key means
@@ -184,12 +194,64 @@ int	s;
  * on AGA, so the ECS build box (no Z3660, open bus at 0x10000000) never goes
  * there.  The mailbox is then verified by reading DRVTYPE (the firmware returns
  * only 0 or 1; anything else means open bus / not a piscsi window).
+ *
+ * MAPPING STRATEGY -- why the metal box needs no sptalloc() at all.
+ *
+ * AMIX's supervisor root table has FOUR level-A entries, one per 1 GB section
+ * (tc_on encodes TIA=2; the table is built in ml/exp pstart()).  Entry 0, which
+ * covers VA 0x00000000-0x3FFFFFFF, is a single EARLY-TERMINATION page descriptor
+ * whose page address is 0 -- a straight identity map of the whole low 1 GB, RAM
+ * or not.  That is why immu.h defines phystokv(p) as (p), why stock Amiga
+ * drivers simply dereference the address autocon() gave them, and why the AGA
+ * gate above can read VPOSR at 0xDFF004 before anything has been mapped.  Only
+ * section 1 (VSECT1 = 0x40000000, the kernel-virtual arena) is page-table-backed,
+ * and section 1 is what sptalloc() hands addresses out of.
+ *
+ * This is NOT the 68030 transparent-translation registers: amiga/boot/copyit.s
+ * pmoves ZERO into %tt0/%tt1, and ttrap.s's "tt0_on" word 0x003F0143 has E=0 --
+ * its own comment says "Disable".  TT is off in AMIX; the low-1 GB reachability
+ * is a page-table early termination.  Same 0x40000000 boundary, different
+ * mechanism than the "TT-gap safe" story this driver used to tell.  (The driver
+ * already depends on that identity in its datapath: cp->addr is a PHYSICAL
+ * address by contract -- see NOTES.md 2026-07-11 (a) -- and z3660_rw() both
+ * bcopy()s through it and hands it to the firmware as *_ADDR3 unchanged.)
+ *
+ * So when the board sits below VSECT1 -- the shipped Z3660 config, autoconfig_rtg
+ * NO, fixed base 0x10000000 -- its physical address ALREADY IS a valid supervisor
+ * VA and no mapping call is needed.  That matters: sptalloc() draws from sptmap,
+ * a HARDCODED 2048-page (4 MB) resource map that page[] -- sized by presented RAM
+ * -- is carved out of first, so its free runs shrink as RAM grows (this is what
+ * made the sibling z3660eth driver's 65-page mapping fail past ~83 MB, printing
+ * "no Z3660 ethernet found" for a perfectly visible board).  The 33 pages here
+ * (1 register + BOUNCE_PAGES) were sitting inside that budget for no reason.
+ *
+ * BOTH windows can go direct because BOTH are board apertures, not kernel RAM.
+ * The register window is obvious.  The bounce buffer is the subtler one: despite
+ * the name it is NOT memory this driver allocates for DMA staging -- it is the
+ * FIRMWARE's staging area at a fixed board offset (Z3660 src/memorymap.h:
+ * SCSI_NO_DMA_ADDRESS = RTG_BASE+0x80000), which both sides address by that
+ * offset and which the driver only ever bcopy()s to/from.  Its address is never
+ * vtop()'d and never handed to the firmware (*_ADDR3 always carries the caller's
+ * buffer), so moving it from an sptalloc'd VA to its physical address is
+ * invisible to the datapath.  Hence 33 pages freed, not 1.
+ *
+ * sptalloc() is kept for a board at or above VSECT1 -- autoconfig_rtg YES puts
+ * the combo window at 0x40000000, inside the page-table-backed section, exactly
+ * the case a4091-init.c has always handled.  The direct path is chosen only when
+ * the ENTIRE span the driver touches (base .. base+Z3660_WINDOW_TOP) stays below
+ * VSECT1, so a board based just under the boundary still takes the mapped path
+ * rather than running off the end of section 0.
+ *
+ * Cache semantics are identical either way: section 0 carries CI clear, and the
+ * sptalloc path could never have been cache-inhibited either -- this kernel has
+ * no PG_CI bit at all (immu.h defines only PG_ADDR/PG_LOCK/PG_M/PG_REF/PG_W/PG_V).
+ * Neither mapping was ever freed, on either path.
  */
 static int
 z3660map()
 {
 	long	base, size;
-	ulong	t;
+	ulong	t, bp;
 
 	if (regs)
 		return 0;
@@ -201,12 +263,26 @@ z3660map()
 		base = Z3660_FIXED;	/* AGA: probe the fixed combo window */
 	}
 	board_phys = base;
-	regs   = (volatile uchar *)sptalloc( 1, PG_V,
-			phystopfn( (paddr_t)base + PISCSI_OFFSET), 0);
-	bounce = (volatile uchar *)sptalloc( BOUNCE_PAGES, PG_V,
-			phystopfn( (paddr_t)base + BOUNCE_OFFSET), 0);
+	bp = (ulong)base;
+
+	/*
+	 * Whole window inside the identity-mapped section 0?  Then the physical
+	 * address is the kernel VA.  The subtraction cannot wrap: bp < VSECT1.
+	 */
+	if (bp < (ulong)VSECT1 &&
+	    ((ulong)VSECT1 - bp) >= (ulong)Z3660_WINDOW_TOP) {
+		z3660_direct_map = 1;
+		regs   = (volatile uchar *)phystokv( (paddr_t)base + PISCSI_OFFSET);
+		bounce = (volatile uchar *)phystokv( (paddr_t)base + BOUNCE_OFFSET);
+	} else {
+		z3660_direct_map = 0;
+		regs   = (volatile uchar *)sptalloc( 1, PG_V,
+				phystopfn( (paddr_t)base + PISCSI_OFFSET), 0);
+		bounce = (volatile uchar *)sptalloc( BOUNCE_PAGES, PG_V,
+				phystopfn( (paddr_t)base + BOUNCE_OFFSET), 0);
+	}
 	if (regs == 0 || bounce == 0) {
-		regs = 0;
+		regs = 0;		/* sptalloc failure, or a base of 0 */
 		return ENOMEM;
 	}
 	WRLONG( P_DRVNUMX, 6);
