@@ -1,3 +1,13 @@
+## 2026-08-14 — z3660: direct board mapping below VSECT1 (8293cdc)
+
+z3660map() takes the physical base as the kernel VA when the whole span stays under
+0x40000000 (section-0 early-termination identity map — AMIX never enables the TT registers);
+sptalloc kept only for a base at/above VSECT1. BOTH windows go direct — the bounce window is
+the FIRMWARE's own staging area at board+0x80000 (SCSI_NO_DMA_ADDRESS), a mapping not an
+allocation. sptmap draw at the metal base: 33 pages → 0 (with z3660net's fix: 98 pages
+returned to the 2048-page pool). Falsification-tested (52/52 gating; moving the mock base
+flips z3660_direct_map and fails exactly one gate). Reaches the box at the next kernel
+relink/golden regeneration.
 # Changelog
 
 ## 2026-07-12
