@@ -101,6 +101,12 @@
 #define	P_WRITE_ADDR3	0x248
 #define	P_BLOCKSIZE0	0x200		/* + unit*4, units 0..7 */
 #define	P_BLOCKS0	0x220		/* + unit*4, units 0..7 */
+/*
+ * Depth of the piscsi per-unit register arrays, and so of this driver's per-unit
+ * geometry cache (see z3660_geom[] below): P_BLOCKSIZE0..+0x1C and
+ * P_BLOCKS0..+0x1C, with P_WRITE_ADDR1 starting immediately after them at 0x240.
+ */
+#define	Z3660_NUNITS	8
 
 /* SCSI opcodes we interpret */
 #define	C_TUR		0x00
@@ -119,6 +125,9 @@ extern int	autocon();
 extern caddr_t	sptalloc();
 extern void	bcopy();
 extern int	printf();
+
+/* per-unit static-geometry cache; defined below, filled from z3660map() above it */
+static void	z3660_geom_fill();
 
 static volatile uchar	*regs;		/* board+0x2000 register window  */
 static volatile uchar	*bounce;	/* board+0x80000 bounce buffer   */
@@ -252,6 +261,7 @@ z3660map()
 {
 	long	base, size;
 	ulong	t, bp;
+	int	i;
 
 	if (regs)
 		return 0;
@@ -293,6 +303,16 @@ z3660map()
 		return ENXIO;
 	}
 	z3660_present = 1;
+	/*
+	 * ATTACH: fill the per-unit static-geometry cache in one sweep of all 8
+	 * piscsi units, so that no CDB ever pays for block size / block count /
+	 * device type again.  See the cache's own comment below for the full
+	 * invalidation rationale -- in short, every firmware remap is bracketed by
+	 * a 68k reset that reloads this kernel, so the cache cannot go stale.
+	 * Runs inside the caller's spl6 mailbox bracket, like the probe above.
+	 */
+	for (i = 0; i < Z3660_NUNITS; ++i)
+		z3660_geom_fill( i);
 	return 0;
 }
 
@@ -316,42 +336,137 @@ char	**ap;
 	return 1;
 }
 
-static ulong
-z3660_blocksize( unit)
+/*
+ * ---------------------------------------------------------------------------
+ * Per-unit static-geometry cache -- why it exists, and why it never needs
+ * invalidating.
+ * ---------------------------------------------------------------------------
+ *
+ * COST.  Every access to this board's window is a CROSS-CORE ROUND TRIP, not a
+ * bus cycle: core1 (the guest's own CPU) publishes the access into the shared
+ * struct and then HARD-SPINS, retiring no 68k instructions, until core0 picks it
+ * up from a cooperative protothread loop that services at most ONE access per
+ * iteration -- with the RTG paths, the ethernet thread and an unconditional
+ * MPEG-decode call all sitting on the critical path of every one of them (Z3660
+ * docs/piscsi-service-path.md 1.1-1.3).  A command's cost is therefore dominated
+ * by how many REGISTERS it touches, not by how many bytes it moves.
+ *
+ * The pre-cache driver spent TEN round trips on a 2 KB READ and nine of them
+ * carried no payload.  Four were pure waste, re-fetched on every single CDB:
+ *
+ *   P_BLOCKSIZE0 + unit*4   block size of the unit
+ *   P_PDT                   peripheral device type (0x00 disk / 0x05 CD-ROM)
+ *   P_BLOCKS0 + unit*4      block count of the unit
+ *   P_DRVNUMX               a second, redundant unit select inside z3660_pdt()
+ *
+ * Caching those per unit leaves SIX trips for a READ and FIVE for a WRITE --
+ * the descriptor triple, the doorbell, and the USED_DMA readback, i.e. only the
+ * accesses that actually carry the request.  Nothing on the wire changes: no new
+ * register, no new command, no reordering the firmware can observe (see ORDERING
+ * below).  The firmware needs no change for this.
+ *
+ * WHEN COULD A CACHED FACT LEGITIMATELY CHANGE?  All three are fields of the
+ * firmware's devs[unit] entry, and every one of them is written ONLY by
+ * piscsi_map_drive() (Z3660 src/scsi/scsi.c): block_size at :924/:938/:953, pdt
+ * from its is_cd argument, and the block count is derived from d->fs, the
+ * f_size() of the backing .hdf captured when that file was opened.  These are
+ * fixed-size image files opened once.  The firmware never resizes, re-opens or
+ * re-types a mapped unit while the guest runs, and it has no media-change or
+ * hot-attach path at all -- config.cd_target[] is consulted only inside
+ * piscsi_init().
+ *
+ * piscsi_map_drive() has exactly two entry points, piscsi_init() and the drive
+ * refresh, and BOTH run only with the 68k held in reset: main.c reset_thread()
+ * calls piscsi_refresh_drives() and then sets state68k = M68K_RESET, and
+ * cpu_emulator.c's reset arm calls piscsi_init() while the 68k is still held.
+ * So every remap is bracketed by a guest reset, which reloads the AMIX kernel
+ * and zeroes this driver's BSS along with it.  The cache therefore CANNOT
+ * outlive the facts it caches, and no runtime invalidation hook is needed -- or
+ * even reachable: there is no wire signal by which the guest could learn of a
+ * remap, so a driver-side invalidate could never be triggered in the first
+ * place.  Rescan/re-probe is covered too: z3660map() refills the whole cache,
+ * and it re-runs whenever `regs` is 0.
+ *
+ * The ONE fact a rescan can genuinely change is whether a unit has a drive
+ * mapped at all, so that fact is deliberately left UNCACHED: an entry is marked
+ * valid only when the unit reports a nonzero block count -- the driver's own
+ * long-standing "the firmware has no drive mapped here" test.  A unit that was
+ * empty at attach is thus re-read on every command to it, exactly as before.
+ * That is off the hot path, because such a command is refused without touching
+ * the medium anyway.
+ *
+ * ORDERING (the one protocol subtlety).  P_PDT is not addressed per unit: it
+ * returns devs[piscsi_cur_drive].pdt, so the unit must be SELECTED first (as
+ * backend_drive_present()/fetch_geometry() do in the a3000_scsi Path B mirror).
+ * And a read of P_BLOCKSIZE0+4n / P_BLOCKS0+4n REASSIGNS piscsi_cur_drive to n
+ * as a side effect (scsi.c :1998, :1944) -- which is why the fill below does
+ * both of those reads BEFORE writing P_DRVNUMX and reading P_PDT.  Since all
+ * four accesses concern the same unit the firmware is left with
+ * piscsi_cur_drive == unit either way, identical to the pre-cache sequence.  On
+ * the command path the surviving P_DRVNUMX write still leaves
+ * piscsi_cur_drive == unit before the doorbell, which keeps the firmware's
+ * `val != piscsi_cur_drive` warning (scsi.c :1388) silent; the data path itself
+ * indexes devs[val] from the doorbell's own value, never the selected drive.
+ *
+ * If a future firmware ever DOES gain a live remap or a media change, it must
+ * announce it on the wire (a change counter, or an interrupt).  That is a
+ * protocol change, owned by the Z3660 repo -- and this cache is the reason it
+ * cannot be introduced there silently.
+ */
+/*
+ * Non-static so a userland tool can read the latched geometry via /dev/kmem --
+ * the same diagnostic convention as z3660_lastblock/z3660_blocks0 above.
+ */
+struct z3660_unitgeom {
+	ulong	bs;		/* block size; the firmware's 0 already folded to 512 */
+	ulong	nblocks;	/* total blocks; 0 == no drive mapped at this unit     */
+	ulong	pdt;		/* 0x00 direct-access disk, 0x05 read-only CD-ROM      */
+	ulong	valid;		/* nonzero == bs/nblocks/pdt are cached and usable     */
+};
+struct z3660_unitgeom	z3660_geom[Z3660_NUNITS];
+
+/*
+ * The answer for a unit outside the piscsi per-unit arrays -- byte-for-byte what
+ * the pre-cache accessors returned when handed an out-of-range unit: block size
+ * 512, no blocks (so every data command to it is refused), device type disk.
+ */
+static struct z3660_unitgeom	z3660_geom_absent = { 512, 0, 0x00, 0 };
+
+/*
+ * Read one unit's static geometry off the mailbox and latch it: four round trips,
+ * paid once per unit at attach.  See ORDERING above for why the two per-unit
+ * array reads must precede the P_DRVNUMX select and the P_PDT read.
+ */
+static void
+z3660_geom_fill( unit)
 int	unit;
 {
-	ulong	bs;
+	ulong	bs, nb;
 
-	if (unit < 0 || unit > 7)
-		return 512;
 	bs = RDLONG( P_BLOCKSIZE0 + unit * 4);
-	return (bs == 0) ? 512 : bs;
-}
-
-static ulong
-z3660_nblocks( unit)
-int	unit;
-{
-	if (unit < 0 || unit > 7)
-		return 0;
-	return RDLONG( P_BLOCKS0 + unit * 4);
+	nb = RDLONG( P_BLOCKS0 + unit * 4);
+	WRLONG( P_DRVNUMX, unit);
+	z3660_geom[unit].pdt     = RDLONG( P_PDT);
+	z3660_geom[unit].bs      = (bs == 0) ? 512 : bs;
+	z3660_geom[unit].nblocks = nb;
+	z3660_geom[unit].valid   = (nb != 0);	/* unmapped units stay re-readable */
 }
 
 /*
- * Peripheral device type of a unit, read straight from the piscsi P_PDT
- * mailbox register -- the SINGLE source of device type (0x00 = direct-access
- * disk, 0x05 = CD-ROM).  P_PDT reflects whatever unit DRVNUMX last selected, so
- * select it first (as backend_drive_present()/fetch_geometry() do in the
- * a3000_scsi Path B mirror), then read.
+ * The single geometry entry point on the command path: a cache hit costs no
+ * mailbox traffic whatsoever.  A miss can only be a unit that had no drive
+ * mapped when the cache was filled, and it then costs exactly what the pre-cache
+ * driver always spent -- once per command, not once per fact.
  */
-static ulong
-z3660_pdt( unit)
+static struct z3660_unitgeom *
+z3660_geom_get( unit)
 int	unit;
 {
-	if (unit < 0 || unit > 7)
-		return 0x00;
-	WRLONG( P_DRVNUMX, unit);
-	return RDLONG( P_PDT);
+	if (unit < 0 || unit >= Z3660_NUNITS)
+		return &z3660_geom_absent;
+	if (z3660_geom[unit].valid == 0)
+		z3660_geom_fill( unit);
+	return &z3660_geom[unit];
 }
 
 /*
@@ -506,6 +621,7 @@ struct sdcom	*cp;
 	ulong	block, blocks, bs, nb, pdt;
 	uchar	*data;
 	uchar	op;
+	struct z3660_unitgeom	*g;
 
 	/*
 	 * Bracket the ENTIRE transaction -- register setup, the synchronous
@@ -529,9 +645,17 @@ struct sdcom	*cp;
 	op   = cp->cdb[0];
 	z3660_lastcmd = op;
 
+	/*
+	 * Select the unit for this command -- the ONE surviving preamble round
+	 * trip.  Block size, block count and device type then come from the
+	 * per-unit cache filled at attach (z3660_geom_get(), no mailbox traffic on
+	 * a hit); before that cache existed these three facts cost four further
+	 * round trips on every single CDB.
+	 */
 	WRLONG( P_DRVNUMX, unit);
-	bs = z3660_blocksize( unit);
-	pdt = z3660_pdt( unit);		/* 0x00 disk, 0x05 CD-ROM (sole device-type source) */
+	g   = z3660_geom_get( unit);
+	bs  = g->bs;
+	pdt = g->pdt;			/* 0x00 disk, 0x05 CD-ROM (sole device-type source) */
 
 	cp->status = 0;			/* default GOOD */
 	cp->okay   = TRUE;
@@ -602,7 +726,7 @@ struct sdcom	*cp;
 	case C_READ_CAP10:
 		if (data && cp->nbyte >= 8) {
 			ulong	lba;
-			blocks = z3660_nblocks( unit);
+			blocks = g->nblocks;
 			lba = blocks - 1;			/* returned LBA = last block */
 			data[0] = (lba >> 24); data[1] = (lba >> 16);
 			data[2] = (lba >> 8);  data[3] = lba;
@@ -615,7 +739,7 @@ struct sdcom	*cp;
 		if (data && cp->nbyte >= 12) {
 			ulong	nbk;
 			for (i = 0; i < (int)cp->nbyte; ++i) data[i] = 0;
-			blocks  = z3660_nblocks( unit);
+			blocks  = g->nblocks;
 			nbk     = (blocks - 1) & 0xFFFFFF;	/* 24-bit block count  */
 			data[0] = 3 + 8;			/* mode data length        */
 			if (pdt == 0x05)
@@ -638,7 +762,7 @@ struct sdcom	*cp;
 		if (pdt == 0x05 && data && cp->nbyte >= 16) {
 			ulong	nbk;
 			for (i = 0; i < (int)cp->nbyte; ++i) data[i] = 0;
-			blocks  = z3660_nblocks( unit);
+			blocks  = g->nblocks;
 			nbk     = (blocks - 1) & 0xFFFFFF;	/* 24-bit block count  */
 			data[0] = 0; data[1] = 8 + 8 - 2;	/* mode data length 0x000E */
 			data[3] = 0x80;				/* CD-ROM: write-protected (WP) */
@@ -686,7 +810,7 @@ struct sdcom	*cp;
 			cp->okay   = TRUE;
 			break;
 		}
-		nb = z3660_nblocks( unit);
+		nb = g->nblocks;
 		z3660_blocks0 = nb;
 		/* nb == 0 means the firmware has no drive mapped at this unit --
 		 * it would silently no-op the I/O and we must NOT report GOOD. */

@@ -32,6 +32,32 @@ Gating (mount-critical, gate the exit code):
 - TEST UNIT READY GOOD for both.
 - Board mapping: `z3660map()` takes the **direct** (section-0 identity) arm and
   calls no `sptalloc()` — see below.
+- **Per-CDB round-trip budget** — see below.
+
+## Round-trip budget: why register accesses are the unit of cost
+
+On real hardware every mailbox register access is a **cross-core round trip**, not a
+bus cycle: core1 (the guest's own CPU) publishes the access and then hard-spins,
+retiring no 68k instructions, until core0 services it from a cooperative protothread
+loop that handles at most one access per iteration (`../Z3660`
+`docs/piscsi-service-path.md` §1.1–1.3). A command's cost is therefore set by how
+many registers it touches, not by how many bytes it moves — so the mock counts every
+`WRLONG`/`RDLONG` (`mock_trips*`, reset by `mock_trips_reset()`), and that count is a
+faithful, mock-independent proxy for metal cost.
+
+`test_hotpath_trip_budget()` gates the exact per-CDB totals — **6** for a 2 KB
+READ(10), **5** for a WRITE(10) — and, separately, that the three static per-unit
+geometry registers (`BLOCKSIZE0+4n`, `BLOCKS0+4n`, `PDT`) are **not touched at all**
+on the command path, and that `DRVNUMX` is written exactly once. Before the per-unit
+geometry cache those figures were 10 and 9, with a redundant second `DRVNUMX` write.
+The named category counters matter: a regression that reinstated one re-fetch fails
+by name rather than as an opaque total. `test_direct_mapping()` additionally gates the
+probe's breakdown (8 × BLOCKSIZE, 8 × BLOCKS, 8 × PDT) to pin the cache fill to
+**attach**, so it cannot silently drift back into the command path.
+
+A cheap-but-wrong cache would pass every count, so the same gate re-checks READ
+CAPACITY(10)'s reported block size and block count against the mock's geometry while
+asserting it cost no wire reads.
 
 Stretch (reported, never gated): a parity table of the driver against the CD
 half of the firmware oracle

@@ -131,11 +131,204 @@ static void test_direct_mapping()
 	printf("[GATE] board mapped DIRECTLY (no sptalloc below VSECT1)\n");
 	CHECK( z3660_direct_map == 0,
 	       "z3660_direct_map is 0 before the board is mapped");
+	mock_trips_reset();
 	CHECK( z3660present( &g_probe_base) == 1, "z3660present() finds the board");
 	printf("       base=0x%08lX direct_map=%d\n",
 	       (unsigned long)g_probe_base, (int)z3660_direct_map);
 	CHECK( z3660_direct_map == 1,
 	       "z3660map() took the section-0 identity arm, not sptalloc()");
+
+	/*
+	 * The per-unit static-geometry cache must be filled HERE, at attach --
+	 * one sweep of all 8 piscsi units -- so that no later CDB pays for it.
+	 * Gating the probe's trip breakdown pins that down: eight BLOCKSIZE0+4n
+	 * reads, eight BLOCKS0+4n reads and eight PDT reads (each preceded by its
+	 * own DRVNUMX select, plus the one DRVNUMX the DRVTYPE presence probe
+	 * itself writes).  If the fill were ever moved back into the command path
+	 * these counts would drop to zero and the hot-path gate below would rise.
+	 */
+	printf("       probe trips=%lu (rd=%lu wr=%lu) drvnumx=%lu blocksize=%lu blocks=%lu pdt=%lu\n",
+	       mock_trips, mock_trips_rd, mock_trips_wr, mock_trips_drvnumx,
+	       mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt);
+	CHECK( mock_trips_blocksize == 8,
+	       "attach fills BLOCKSIZE for all 8 units (geometry cached at probe)");
+	CHECK( mock_trips_blocks == 8,
+	       "attach fills BLOCKS for all 8 units (geometry cached at probe)");
+	CHECK( mock_trips_pdt == 8,
+	       "attach fills PDT for all 8 units (geometry cached at probe)");
+	CHECK( mock_trips_drvnumx == 9,
+	       "attach selects each unit before its PDT read (8) + the DRVTYPE probe (1)");
+}
+
+/* ====================================================================== */
+/* GATING: per-CDB round-trip budget.                                      */
+/*                                                                         */
+/* Every mailbox register access is one cross-core round trip during which  */
+/* core1 -- the guest's own CPU -- hard-spins retiring no instructions,     */
+/* while core0 services it from a cooperative protothread loop that handles */
+/* at most ONE access per iteration (Z3660 docs/piscsi-service-path.md      */
+/* sections 1.1-1.3).  Round trips, not bytes, are what a 2 KB request      */
+/* costs, so the trip budget per CDB is the driver's real performance       */
+/* contract and belongs in a gate.                                          */
+/*                                                                         */
+/* That doc's table 1.1 measured the pre-cache driver at TEN trips per 2 KB */
+/* READ, of which nine carried no payload:                                  */
+/*                                                                         */
+/*   1  WRLONG DRVNUMX        select the unit          <- kept              */
+/*   2  RDLONG BLOCKSIZE0+4n  static after attach      <- cached            */
+/*   3  WRLONG DRVNUMX        redundant repeat of 1    <- deleted           */
+/*   4  RDLONG PDT            static after attach      <- cached            */
+/*   5  RDLONG BLOCKS0+4n     static after attach      <- cached            */
+/*   6  WRLONG READ_ADDR1     block number                                  */
+/*   7  WRLONG READ_ADDR2     byte length                                   */
+/*   8  WRLONG READ_ADDR3     buffer address                                */
+/*   9  WRLONG READ           the doorbell (carries the data)               */
+/*  10  RDLONG USED_DMA       bounce-or-direct verdict                      */
+/*                                                                         */
+/* Trips 2-5 are now served from the per-unit cache filled at attach, so a  */
+/* steady-state READ costs SIX and a WRITE (no USED_DMA readback) FIVE.     */
+/* The gate asserts the exact totals and, separately, that the three static */
+/* geometry registers are not touched at all on the command path -- so a    */
+/* regression that reinstated one of them fails loudly and by name.         */
+/* ====================================================================== */
+
+static void test_hotpath_trip_budget()
+{
+	uchar		cdb[10], buf[2048], src[512];
+	unsigned char	*back = mock_backing( U_DISK);
+	int		i;
+	unsigned long	rd_trips, wr_trips;
+
+	printf("\n=== GATE: per-CDB mailbox round-trip budget ===\n");
+
+	/* ---- steady-state READ(10): 4 x 512-byte blocks @ LBA 8 (one chunk) ---- */
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[5] = 8; cdb[8] = 4;
+	memset( buf, 0, sizeof buf);
+	mock_trips_reset();
+	run_cmd( U_DISK, cdb, 10, buf, 2048);
+	rd_trips = mock_trips;
+	printf("       READ(10) 2KB: trips=%lu (rd=%lu wr=%lu) drvnumx=%lu blocksize=%lu blocks=%lu pdt=%lu\n",
+	       mock_trips, mock_trips_rd, mock_trips_wr, mock_trips_drvnumx,
+	       mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt);
+	CHECK( g_okay && g_status == 0, "trip budget: READ(10) still completes GOOD");
+	CHECK( memcmp( buf, back + 8 * 512, 2048) == 0,
+	       "trip budget: READ(10) data still correct (cached bs scales the LBA)");
+	CHECK( mock_trips_blocksize == 0,
+	       "trip budget: READ(10) reads NO BLOCKSIZE register (served from cache)");
+	CHECK( mock_trips_blocks == 0,
+	       "trip budget: READ(10) reads NO BLOCKS register (served from cache)");
+	CHECK( mock_trips_pdt == 0,
+	       "trip budget: READ(10) reads NO PDT register (served from cache)");
+	CHECK( mock_trips_drvnumx == 1,
+	       "trip budget: READ(10) writes DRVNUMX exactly once (redundant repeat gone)");
+	CHECK( rd_trips == 6,
+	       "trip budget: READ(10) costs 6 round trips (was 10 before the cache)");
+
+	/* ---- steady-state WRITE(10): 1 x 512-byte block @ LBA 12 ---- */
+	for (i = 0; i < 512; i++) src[i] = (uchar)(0x30 + (i & 0x0F));
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x2A; cdb[5] = 12; cdb[8] = 1;
+	mock_trips_reset();
+	run_cmd( U_DISK, cdb, 10, src, 512);
+	wr_trips = mock_trips;
+	printf("       WRITE(10) 512B: trips=%lu (rd=%lu wr=%lu) drvnumx=%lu blocksize=%lu blocks=%lu pdt=%lu\n",
+	       mock_trips, mock_trips_rd, mock_trips_wr, mock_trips_drvnumx,
+	       mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt);
+	CHECK( g_okay && g_status == 0, "trip budget: WRITE(10) still completes GOOD");
+	CHECK( memcmp( back + 12 * 512, src, 512) == 0,
+	       "trip budget: WRITE(10) still lands in backing[12*512..]");
+	CHECK( mock_trips_blocksize == 0 && mock_trips_blocks == 0 && mock_trips_pdt == 0,
+	       "trip budget: WRITE(10) touches none of the three static geometry registers");
+	CHECK( mock_trips_drvnumx == 1,
+	       "trip budget: WRITE(10) writes DRVNUMX exactly once");
+	CHECK( wr_trips == 5,
+	       "trip budget: WRITE(10) costs 5 round trips (was 9 before the cache)");
+
+	/*
+	 * The cached facts must still be the RIGHT facts -- a cache that answers
+	 * cheaply but wrongly would pass every count above.  READ CAPACITY(10)
+	 * reports block size and block count straight out of the cache; assert
+	 * both are the mock's geometry AND that answering cost zero wire reads.
+	 */
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x25;
+	memset( buf, 0xEE, sizeof buf);
+	mock_trips_reset();
+	run_cmd( U_DISK, cdb, 10, buf, 8);
+	printf("       READ CAPACITY from cache: trips=%lu last_lba=0x%08lX blklen=%lu\n",
+	       mock_trips, be32( buf), be32( buf + 4));
+	CHECK( be32( buf) == DK_NBLK - 1 && be32( buf + 4) == DK_BS,
+	       "trip budget: cached geometry is CORRECT (last LBA + block length)");
+	CHECK( mock_trips == 1,
+	       "trip budget: READ CAPACITY costs 1 trip (the DRVNUMX select) -- geometry cached");
+}
+
+/*
+ * GATING: an UNMAPPED unit must never be cached as absent.
+ *
+ * "Is a drive mapped at this unit at all" is the one fact a firmware rescan can
+ * legitimately change, so the driver marks a cache entry valid only when the unit
+ * reports a nonzero block count.  Two things must therefore hold for a unit with
+ * no drive behind it:
+ *
+ *   1. The I/O is still REFUSED.  The firmware silently no-ops a read or write to
+ *      an unmapped drive, so reporting GOOD would hand the caller a buffer full of
+ *      whatever was already there -- which is why the driver has always treated
+ *      nblocks == 0 as a hard error.  A cache must not weaken that.
+ *   2. The unit is RE-READ on the next command rather than being permanently
+ *      poisoned by its first (empty) probe.  Asserting the trip breakdown twice
+ *      proves the re-read: identical non-zero geometry-register counts both times.
+ *
+ * This is the one path where the cache deliberately does NOT save trips; it costs
+ * one extra DRVNUMX write versus the pre-cache driver, on a command that is
+ * refused anyway, and only ever during sd.c's boot-time bus scan.
+ */
+#define U_EMPTY	3		/* no mock_add_drive() for this unit */
+
+static void test_unmapped_unit_not_cached()
+{
+	uchar		cdb[10], buf[512];
+	unsigned long	first_trips;
+
+	printf("\n=== GATE: unmapped unit refused, and never cached as absent ===\n");
+
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[8] = 1;	/* READ(10) 1 block */
+	memset( buf, 0xEE, sizeof buf);
+	mock_trips_reset();
+	run_cmd( U_EMPTY, cdb, 10, buf, 512);
+	first_trips = mock_trips;
+	printf("       pass 1: trips=%lu blocksize=%lu blocks=%lu pdt=%lu status=0x%02X okay=%d\n",
+	       mock_trips, mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt,
+	       g_status, (int)g_okay);
+	CHECK( !g_okay && g_status == 0xff,
+	       "unmapped unit: READ(10) REFUSED (firmware would silently no-op it)");
+	CHECK( mock_trips_blocks == 1,
+	       "unmapped unit: geometry was actually probed (cache miss, not a stale hit)");
+
+	/* Second identical command: the miss must repeat, i.e. nothing was latched. */
+	memset( buf, 0xEE, sizeof buf);
+	mock_trips_reset();
+	run_cmd( U_EMPTY, cdb, 10, buf, 512);
+	printf("       pass 2: trips=%lu blocksize=%lu blocks=%lu pdt=%lu status=0x%02X okay=%d\n",
+	       mock_trips, mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt,
+	       g_status, (int)g_okay);
+	CHECK( !g_okay && g_status == 0xff,
+	       "unmapped unit: second READ(10) still refused");
+	CHECK( mock_trips_blocks == 1 && mock_trips_blocksize == 1 && mock_trips_pdt == 1,
+	       "unmapped unit: RE-PROBED on every command (absence never cached)");
+	CHECK( mock_trips == first_trips,
+	       "unmapped unit: identical trip cost both passes (no latched state)");
+
+	/*
+	 * And the mapped units must be untouched by all of that -- a fill for one
+	 * unit must not disturb another's cached entry.
+	 */
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x25;		/* READ CAPACITY(10) */
+	memset( buf, 0xEE, sizeof buf);
+	mock_trips_reset();
+	run_cmd( U_DISK, cdb, 10, buf, 8);
+	CHECK( g_okay && be32( buf) == DK_NBLK - 1 && be32( buf + 4) == DK_BS,
+	       "unmapped unit: mapped unit's cached geometry still intact afterwards");
+	CHECK( mock_trips == 1,
+	       "unmapped unit: mapped unit still answers from cache (1 trip)");
 }
 
 /* ====================================================================== */
@@ -587,6 +780,9 @@ int main()
 	test_disk_write10_frozen();
 
 	test_tur_both();
+
+	test_hotpath_trip_budget();
+	test_unmapped_unit_not_cached();
 
 	test_reentry();
 	test_completion_trampoline();

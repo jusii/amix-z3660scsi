@@ -101,6 +101,23 @@ void	(*fn)();
 	g_inflight_hook = fn;
 }
 
+/*
+ * Round-trip counters (see mock_piscsi.h).  Every WRLONG/RDLONG below bumps
+ * these, because on metal every one of them is a full cross-core handshake with
+ * core1 spinning for its duration -- so this is a direct model of the driver's
+ * per-CDB cost, not a mock artifact.
+ */
+unsigned long	mock_trips, mock_trips_rd, mock_trips_wr;
+unsigned long	mock_trips_drvnumx, mock_trips_blocksize;
+unsigned long	mock_trips_blocks, mock_trips_pdt;
+
+void mock_trips_reset()
+{
+	mock_trips = mock_trips_rd = mock_trips_wr = 0;
+	mock_trips_drvnumx = mock_trips_blocksize = 0;
+	mock_trips_blocks = mock_trips_pdt = 0;
+}
+
 /* -------- board seams the driver externs (resolved here) ---------------- */
 
 /*
@@ -238,6 +255,10 @@ void z3660_mock_wrlong( cmd, val)
 unsigned int	cmd;
 unsigned long	val;
 {
+	mock_trips++;
+	mock_trips_wr++;
+	if (cmd == R_DRVNUMX)
+		mock_trips_drvnumx++;
 	if (cmd >= R_READ_ADDR1 && cmd <= R_READ_ADDR4) {
 		u32_read[(cmd - R_READ_ADDR1) / 4] = val;
 		return;
@@ -258,11 +279,17 @@ unsigned long	val;
 unsigned long z3660_mock_rdlong( cmd)
 unsigned int	cmd;
 {
+	mock_trips++;
+	mock_trips_rd++;
+	if (cmd == R_PDT)
+		mock_trips_pdt++;
 	if (cmd >= R_BLOCKSIZE0 && cmd < R_BLOCKSIZE0 + MOCK_UNITS * 4) {
+		mock_trips_blocksize++;
 		cur_drive = (int)((cmd - R_BLOCKSIZE0) / 4);	/* firmware side effect */
 		return devs[cur_drive].block_size;
 	}
 	if (cmd >= R_BLOCKS0 && cmd < R_BLOCKS0 + MOCK_UNITS * 4) {
+		mock_trips_blocks++;
 		cur_drive = (int)((cmd - R_BLOCKS0) / 4);	/* firmware side effect */
 		return devs[cur_drive].nblocks;
 	}
@@ -308,6 +335,7 @@ void mock_reset()
 	memset( u32_write, 0, sizeof u32_write);
 	used_dma = 0;
 	g_inflight_hook = 0;
+	mock_trips_reset();
 	mock_spl_reset();
 	if (!g_bounce)
 		g_bounce = (unsigned char *)malloc( MOCK_BOUNCE);

@@ -50,4 +50,26 @@ void mock_spl_reset(void);                  /* reset mock IPL + spl counters/kno
  */
 void mock_set_inflight_hook(void (*fn)());
 
+/*
+ * Round-trip accounting.  On real hardware EVERY register access is one
+ * cross-core handshake: core1 (the guest's CPU) publishes the access into the
+ * SHARED struct and then HARD-SPINS, retiring no guest instructions, until
+ * core0's cooperative protothread loop happens to service it
+ * (Z3660 docs/piscsi-service-path.md sections 1.1-1.3).  So counting register
+ * accesses here counts exactly the thing that costs time on metal, and a
+ * per-CDB trip budget is a meaningful, mock-independent regression gate.
+ *
+ * Counters are cumulative; mock_trips_reset() zeroes them (mock_reset() does
+ * too).  The category counters break out the four accesses the per-unit static
+ * geometry cache in src/z3660.c is there to eliminate from the hot path.
+ */
+extern unsigned long mock_trips;            /* ALL register accesses (rd + wr)   */
+extern unsigned long mock_trips_rd;         /* RDLONG only                       */
+extern unsigned long mock_trips_wr;         /* WRLONG only                       */
+extern unsigned long mock_trips_drvnumx;    /* writes to DRVNUMX  (0x90)         */
+extern unsigned long mock_trips_blocksize;  /* reads of BLOCKSIZE0+4n (0x200+)   */
+extern unsigned long mock_trips_blocks;     /* reads of BLOCKS0+4n    (0x220+)   */
+extern unsigned long mock_trips_pdt;        /* reads of PDT       (0xA0)         */
+void mock_trips_reset(void);
+
 #endif

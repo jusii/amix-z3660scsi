@@ -546,3 +546,109 @@ same mock buffers and a silent fallback would otherwise leave every other test g
 52/52 gating, 6/6 parity. Cross-compile clean; the object's undefined-symbol set is
 unchanged (`sptalloc` is still referenced by the retained high arm), so the `nm -u`
 clean gate is unaffected.
+
+## 2026-08-17: per-unit static-geometry cache — 10 → 6 round trips per 2 KB READ
+
+The Z3660 firmware investigation (`../Z3660` branch `piscsi-crawl`,
+`docs/piscsi-service-path.md` §1.1) established the piscsi cost model, and it is not
+the one this driver was written against: **a register access is not a bus cycle, it is
+a cross-core round trip.** Core1 — the guest's own CPU — publishes each access into the
+`SHARED` struct and then *hard-spins, retiring no 68k instructions*, until core0 picks
+it up from a cooperative protothread loop that services **at most one access per
+iteration**, with the RTG paths, the ethernet thread and an unconditional
+`pl_mpeg_arm_decode_progressive()` all on the critical path of every one of them.
+
+So a command's cost is dominated by **how many registers it touches**, not by how many
+bytes it moves. And the steady-state request granularity is 2 KB, not the protocol's
+64 KB `MAXXFER`: raw/`physio` I/O stages through a 2 KB kernel buffer (`NBPP` = 2048,
+and a `vtop()`'d buffer is valid for exactly one page), so the driver pays a full
+transaction per 2 KB — about 1/32 of the protocol's capacity.
+
+### What was being re-fetched, and why it never changes
+
+Of the ten round trips a 2 KB READ used to cost, **nine carried no payload**, and four
+were pure waste — per-unit facts re-read on every single CDB:
+
+| # | access | why it was removable |
+|---:|---|---|
+| 2 | `RDLONG(P_BLOCKSIZE0 + unit*4)` | `devs[unit].block_size` — written only by `piscsi_map_drive()` |
+| 3 | `WRLONG(P_DRVNUMX, unit)` | a **redundant repeat** of trip 1, inside `z3660_pdt()` |
+| 4 | `RDLONG(P_PDT)` | `devs[unit].pdt` — set from `piscsi_map_drive()`'s `is_cd` argument |
+| 5 | `RDLONG(P_BLOCKS0 + unit*4)` | derived from `d->fs`, the `f_size()` of the backing `.hdf` at open time |
+
+All three cached facts are fields of the firmware's `devs[unit]` entry, and every one is
+written **only** by `piscsi_map_drive()` (`Z3660 src/scsi/scsi.c` :924/:938/:953). The
+`.hdf` files are fixed-size images opened once; there is no resize, no re-open, no
+re-type and **no media-change or hot-attach path at all** — `config.cd_target[]` is read
+only inside `piscsi_init()`.
+
+**The invalidation argument is a reset argument.** `piscsi_map_drive()` has exactly two
+entry points, `piscsi_init()` and the drive refresh, and *both run only with the 68k held
+in reset*: `main.c reset_thread()` calls `piscsi_refresh_drives()` and then sets
+`state68k = M68K_RESET`, and `cpu_emulator.c`'s reset arm calls `piscsi_init()` while the
+68k is still held. Every remap is therefore bracketed by a guest reset, which reloads the
+AMIX kernel and zeroes this driver's BSS along with it — **the cache cannot outlive the
+facts it caches.** No runtime invalidation hook is needed, or even reachable: there is no
+wire signal by which the guest could learn of a remap, so a driver-side invalidate could
+never be triggered. Re-probe is covered too (`z3660map()` refills, and re-runs whenever
+`regs` is 0).
+
+The one fact a rescan *can* change — whether a unit has a drive mapped at all — is
+deliberately left **uncached**: an entry is valid only when the unit reports a nonzero
+block count, the driver's own long-standing "no drive mapped here" test. A unit empty at
+attach is re-read on each command to it, exactly as before; that is off the hot path,
+since such a command is refused without touching the medium.
+
+### The one protocol subtlety: ordering
+
+`P_PDT` is not addressed per unit — it returns `devs[piscsi_cur_drive].pdt`, so the unit
+must be selected first. And a read of `P_BLOCKSIZE0+4n` / `P_BLOCKS0+4n` **reassigns
+`piscsi_cur_drive` to `n` as a side effect** (`scsi.c` :1998, :1944). Hence
+`z3660_geom_fill()` does both array reads *before* writing `P_DRVNUMX` and reading
+`P_PDT`. Since all four accesses concern the same unit, the firmware is left with
+`piscsi_cur_drive == unit` either way — identical to the pre-cache sequence. On the
+command path the surviving `P_DRVNUMX` write still leaves `piscsi_cur_drive == unit`
+before the doorbell, keeping the firmware's `val != piscsi_cur_drive` warning
+(`scsi.c` :1388) silent; the data path indexes `devs[val]` from the doorbell's own value,
+never the selected drive. **Wire protocol unchanged: no new register, no new command, no
+firmware change.** An out-of-range unit is also byte-identical — the unconditional
+`P_DRVNUMX` write still happens, and the geometry answer comes from a dedicated
+"absent" entry (bs 512, nblocks 0, pdt 0) matching the old out-of-range returns exactly.
+
+### Measured effect (host harness, not metal)
+
+New `mock_trips*` counters in `test/host/mock_piscsi.c` count every `WRLONG`/`RDLONG`,
+which *is* the metal cost unit. New gate `test_hotpath_trip_budget()`, plus a trip
+breakdown gated inside `test_direct_mapping()` to pin the fill to attach:
+
+| operation | before | after |
+|---|---:|---:|
+| READ(10), 2 KB (one chunk) | **10** | **6** |
+| WRITE(10), 512 B | **9** | **5** |
+| READ CAPACITY(10) | 5 | 1 |
+| attach probe (one-time, all 8 units) | 2 | 34 |
+| READ(10) to an **unmapped** unit (refused) | 4 | 5 |
+
+The unmapped-unit row is the one regression, and it is deliberate: absence is never
+cached, so such a unit is re-probed on every command and pays one extra `P_DRVNUMX`
+write. That happens only during sd.c's boot-time bus scan, on a command that is
+refused without touching the medium. `test_unmapped_unit_not_cached()` gates both
+halves — still refused (the firmware would *silently no-op* the I/O, so reporting GOOD
+would hand the caller stale buffer contents) and still re-probed with identical trip
+cost on a second pass, proving nothing was latched.
+
+That is the ~1.7× reduction in handshakes per 2 KB predicted by
+`piscsi-service-path.md` §7.1. The 32 extra trips at attach are paid once, inside the
+same `spl6` bracket the probe already used — far shorter than the bracket the driver
+routinely holds across a 64 KB transfer plus its SD-card transaction.
+
+**Throughput on metal is NOT proven by this.** The harness proves the trip count fell and
+that the cached facts are still the right facts; it cannot prove core0 loop latency, which
+is what those trips actually buy back. Bench/metal validation is separate.
+
+77/77 gating (52 pre-existing + 25 new), 6/6 parity. Cross-compiled clean with the real
+target compiler (`m68k-cbm-sysv4-gcc` 2.7.2.3, kerntools' `amiga/alien` recipe); the
+`nm -u` clean gate is unaffected — undefined set still exactly `autocon`, `bcopy`,
+`sptalloc`. New symbols are `z3660_geom` (COMMON, 128 B = 8 × 16, kmem-readable like the
+other diagnostics), local `z3660_geom_absent`, and the two local helpers replacing
+`z3660_blocksize`/`z3660_nblocks`/`z3660_pdt`.
