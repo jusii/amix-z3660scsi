@@ -1,3 +1,29 @@
+## 2026-08-17 — z3660: per-unit static-geometry cache — 10 → 6 round trips per 2KB READ (29b2482)
+
+A piscsi register access is a CROSS-CORE ROUND TRIP, not a bus cycle: core1 (the guest's own
+CPU) hard-spins, retiring no 68k instructions, until core0 services it from a cooperative
+protothread loop handling at most ONE access per iteration (../Z3660 docs/piscsi-service-path.md
+§1.1–1.3). Cost is set by registers touched, not bytes moved — and steady-state granularity is
+2KB (physio stages through a 2KB buffer; NBPP=2048), not the protocol's 64KB MAXXFER. Nine of
+the ten trips a 2KB READ cost carried no payload; four were pure waste, re-fetched per CDB:
+BLOCKSIZE0+unit*4, PDT, BLOCKS0+unit*4, and a redundant second DRVNUMX inside z3660_pdt().
+Now cached per unit, filled in one sweep of all 8 units at attach (z3660map()).
+Invalidation rationale is a RESET argument: all three facts are devs[unit] fields written only
+by piscsi_map_drive(), reachable only via piscsi_init()/the drive refresh, and BOTH run with the
+68k held in reset — which reloads this kernel and zeroes the driver's BSS. The cache cannot
+outlive the facts it caches; no runtime invalidation hook is needed or even reachable (no wire
+signal announces a remap). The one fact a rescan CAN change — whether a unit has a drive mapped
+— is deliberately left UNCACHED (valid only when nblocks != 0), so a unit empty at attach is
+re-probed on every command and is still REFUSED, not silently no-op'd.
+Wire protocol unchanged: no new register, no new command, no firmware change. Ordering preserved
+(PDT reflects the last select, and BLOCKSIZE0/BLOCKS0 reads reassign piscsi_cur_drive as a side
+effect, so the fill does both array reads before the DRVNUMX select + PDT read); the surviving
+per-command DRVNUMX write keeps the firmware's val != piscsi_cur_drive warning silent.
+Measured per CDB: READ(10) 2KB 10→6, WRITE(10) 9→5, READ CAPACITY 5→1, attach probe 2→34 (once),
+unmapped unit 4→5 (deliberate). 77/77 gating (52 pre-existing + 25 new), 6/6 parity. Metal
+throughput NOT proven — the harness proves the trip count fell and the cached facts stay correct,
+not core0 loop latency. Reaches the box at the next kernel relink.
+
 ## 2026-08-14 — z3660: direct board mapping below VSECT1 (8293cdc)
 
 z3660map() takes the physical base as the kernel VA when the whole span stays under
