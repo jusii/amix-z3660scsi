@@ -652,3 +652,109 @@ target compiler (`m68k-cbm-sysv4-gcc` 2.7.2.3, kerntools' `amiga/alien` recipe);
 `sptalloc`. New symbols are `z3660_geom` (COMMON, 128 B = 8 × 16, kmem-readable like the
 other diagnostics), local `z3660_geom_absent`, and the two local helpers replacing
 `z3660_blocksize`/`z3660_nblocks`/`z3660_pdt`.
+
+## 2026-08-18: window geometry is byte-primary — the page count is now derived
+
+`src/z3660.c` used to state its board-window geometry as a **page count**:
+
+```c
+#define BOUNCE_PAGES 32                     /* 64KB bounce; Amix NBPP is 2KB, not 4KB! */
+#define BOUNCE_SPAN  (BOUNCE_PAGES * NBPP)  /* 0x10000 == MAXXFER */
+#define Z3660_WINDOW_TOP (BOUNCE_OFFSET + BOUNCE_SPAN)  /* 0x00090000 */
+```
+
+The span derivation used `NBPP`, which looks page-size-aware but is the wrong way round:
+the constant that is *fixed* is the 64 KB firmware aperture at board+0x80000 (`Z3660
+src/memorymap.h`, `SCSI_NO_DMA_ADDRESS`), and the page count is what has to move when the
+page size does. As written, a 4 KB-page kernel would silently keep 32 pages and **double**
+everything derived from them. Measured with the target compiler (see the probe below):
+
+| constant | NBPP 2048, before | NBPP 4096, before | NBPP 2048, after | NBPP 4096, after |
+|---|---:|---:|---:|---:|
+| `BOUNCE_PAGES` | 32 | **32** | 32 | **16** |
+| `BOUNCE_SPAN` | 0x10000 | **0x20000** | 0x10000 | **0x10000** |
+| `Z3660_WINDOW_TOP` | 0x00090000 | **0x000A0000** | 0x00090000 | **0x00090000** |
+
+Both "before" regressions are real, not cosmetic. The doubled span claims 32 pages of
+`sptmap` on the `>= VSECT1` arm instead of 16 — the same scarce 2048-page resource whose
+exhaustion made the sibling `z3660eth` driver fail past ~83 MB (2026-08-14 entry). And the
+moved `Z3660_WINDOW_TOP` widens the direct-map admission test by 64 KB, so a board based
+just under `VSECT1` could be admitted to the identity-map path on a window bound the
+firmware never had.
+
+So the shape is inverted: **bytes are primary, pages are derived, rounded up.**
+
+```c
+#define BOUNCE_BYTES  0x00010000            /* the firmware aperture: 64KB, any page size */
+#define BOUNCE_SPAN   BOUNCE_BYTES
+#define Z3660_PAGES(b) (((b) + NBPP - 1) / NBPP)
+#define BOUNCE_PAGES  Z3660_PAGES( BOUNCE_BYTES)
+```
+
+### The audit: which constants are byte quantities, and which are genuinely per-page
+
+Every remaining constant in the driver was classified, not just the bounce span:
+
+| constant | kind | treatment |
+|---|---|---|
+| `BOUNCE_PAGES` | was a page count | **inverted** — derived from `BOUNCE_BYTES` |
+| the literal `1` in `sptalloc( 1, ...)` for the register window | was an unnamed page count | **inverted** — `REGS_PAGES` from `REGS_BYTES` |
+| `BOUNCE_BYTES`, `BOUNCE_OFFSET`, `PISCSI_OFFSET`, `BOUNCE_THRESH`, `MAXXFER`, `Z3660_FIXED` | firmware/protocol byte addresses and sizes | already byte-primary, no `NBPP` term — unchanged |
+| `Z3660_WINDOW_TOP` | byte bound, but was reached *through* a page count | now purely byte-derived |
+| `Z3660_NUNITS` (8), `Z3660_CQ` (32) | per-unit register-array depth; completion-FIFO depth | **not** page quantities — left alone (the `32` is a coincidence of value, not of meaning) |
+| the arguments to `sptalloc()` and `phystopfn()` | genuinely per-page | stay page-valued *by API* — `sptalloc()` takes a page count and `phystopfn()` a frame number; they are now fed derived values instead of literals |
+
+`REGS_BYTES` is itself derived — `(P_WRITE_ADDR3 + 4)`, the last register this driver
+touches plus its long — so adding a higher register cannot leave the mapping short. It is
+0x24C, one page at both 2048 and 4096, which is why the mapped total stays 33 pages at
+NBPP 2048 and becomes 17 at 4096 rather than 33.
+
+### Compile-time guards (what the 1992-vintage compiler will take)
+
+All the quantities are integer macros, so the guards are plain `#if` / `#error`
+conditionals — no generated code, and they work identically in the kernel build and the
+host harness. `m68k-cbm-sysv4-gcc` 2.7.2.3 accepts `#error`, `%`, and macro-expanded
+arithmetic in `#if` (verified). The negative-array-size idiom
+(`typedef char a[cond ? 1 : -1];`) was also tried and *does* work on this compiler —
+recorded here in case a future assertion needs `sizeof` — but the preprocessor form is
+preferred: it emits nothing at all.
+
+Each page count is pinned from **both** sides, because a hardcoded count fails in both
+directions: too few pages leaves the window tail unmapped, too many burns `sptmap`. The
+pair asserts `count == ceil(bytes / NBPP)` exactly. Every guard was verified by breaking
+one value in a scratch copy and watching it fire:
+
+| deliberate break | guard that fired |
+|---|---|
+| `BOUNCE_PAGES` re-hardcoded to 32, NBPP 4096 | over-covers `BOUNCE_SPAN` — wasted sptmap pages |
+| `BOUNCE_PAGES` re-hardcoded to 16, NBPP 2048 | does not cover `BOUNCE_SPAN` |
+| the **whole pre-change spelling** restored, NBPP 4096 | board window top must not vary with `NBPP` |
+| `REGS_PAGES` hardcoded 1 with a 256 B page / hardcoded 2 at 2048 | under- / over-covers the register file |
+| `MAXXFER` raised to 128 KB | one `MAXXFER` chunk must fit the aperture |
+| `BOUNCE_OFFSET` nudged to 0x80004 | offsets must be page-aligned (and the window-top guard) |
+
+The page-alignment guard is not decoration: `sptalloc()` maps by frame and
+`phystopfn()` truncates, so a misaligned board offset would silently map a window shifted
+down to the frame boundary.
+
+### Evidence
+
+* **No behavioural change on the shipping kernel.** The cross-compiled object is
+  **byte-identical** to the pre-change one (`md5 287395f8eabb5d4fbe9d58dd65143ee9`, 5136 B)
+  under kerntools' real `amiga/alien` recipe:
+  `m68k-cbm-sysv4-gcc -c -O -DSYSV -D_KERNEL -I.. -I../.. -I../inc z3660.c`.
+  `nm -u` clean gate unaffected — still exactly `autocon`, `bcopy`, `sptalloc`.
+* **77/77 gating, 6/6 parity** on the host harness, and 77/77 again with the harness stub's
+  `NBPP` set to 4096, so the datapath is page-size-neutral as well as the geometry.
+* Reproducing the constant table: compile the driver inside a probe TU that overrides the
+  page size before including it —
+  `#include "sys/types.h"` / `#include "sys/immu.h"` (guarded, so it keeps its own `NBPP`
+  out of the way) / `#undef NBPP` / `#define NBPP 4096` / `#include "z3660.c"`, then emit
+  `long v[] = { NBPP, BOUNCE_PAGES, BOUNCE_SPAN, REGS_BYTES, REGS_PAGES, Z3660_WINDOW_TOP };`
+  and read `.data` with `m68k-cbm-sysv4-objdump -s -j .data`. That is the target compiler's
+  own arithmetic, not a transcription.
+
+**No 4 KB-page Amix kernel exists.** This is hardening, not enablement: the kernel's
+`sys/immu.h` hardcodes `NBPP` 2048 alongside `PNUMSHFT` 11 and `POFFMASK` 0x7FF, and a real
+page-size change would have to move all three together. What changes here is that this
+driver would then follow correctly instead of silently over-claiming.

@@ -71,10 +71,21 @@
 #define	VPOSR		0xDFF004	/* Agnus/Alice id: bits 8-14 >= 0x22 -> AGA */
 #define	PISCSI_OFFSET	0x00002000	/* register window within the board */
 #define	BOUNCE_OFFSET	0x00080000	/* bounce buffer within the board */
-#define	BOUNCE_PAGES	32		/* 64KB bounce; Amix NBPP is 2KB, not 4KB! */
+#define	BOUNCE_BYTES	0x00010000	/* size of that bounce aperture: 64KB */
 #define	MAXXFER		65536		/* max bytes per piscsi op */
 #define	BOUNCE_THRESH	0x08000000	/* buffers below this are bounced by the ARM */
-#define	BOUNCE_SPAN	(BOUNCE_PAGES * NBPP)	/* 0x10000 == MAXXFER */
+/*
+ * Board-window geometry is expressed in BYTES, because every quantity above is a
+ * fact about the FIRMWARE's address map (Z3660 src/memorymap.h), not about this
+ * kernel's paging: the aperture is 64KB at board+0x80000 whatever a page happens
+ * to be.  Page COUNTS are derived from these byte sizes further down, next to the
+ * register offsets they are measured against -- never the other way round.  The
+ * page count used to be the primary constant here (BOUNCE_PAGES 32, span =
+ * BOUNCE_PAGES * NBPP), which silently made the span a function of the page size:
+ * the same source that spans 64KB on this NBPP=2048 kernel would have claimed
+ * 128KB of window -- and of sptmap -- on a 4KB-page kernel.
+ */
+#define	BOUNCE_SPAN	BOUNCE_BYTES	/* window span, in bytes, at any page size */
 /* highest board-relative byte this driver ever touches, +1 (the bounce top;
  * the register window at PISCSI_OFFSET sits far below it) */
 #define	Z3660_WINDOW_TOP	(BOUNCE_OFFSET + BOUNCE_SPAN)	/* 0x00090000 */
@@ -107,6 +118,72 @@
  * P_BLOCKS0..+0x1C, with P_WRITE_ADDR1 starting immediately after them at 0x240.
  */
 #define	Z3660_NUNITS	8
+
+/*
+ * PAGE GEOMETRY -- derived from the byte sizes above, never primary.
+ *
+ * The only consumer of a page COUNT in this driver is sptalloc(), whose API takes
+ * one (and which is reached only by the >= VSECT1 board; see z3660map()).  Both
+ * counts are therefore a rounded-up conversion of a firmware byte size, so the
+ * driver claims the same 64KB+register-file of BOARD WINDOW whatever the page
+ * size -- 33 sptmap pages on this NBPP=2048 kernel, 17 on a 4KB-page one --
+ * instead of silently doubling the span, and the sptmap bill, with the page size.
+ *
+ * REGS_BYTES is the piscsi register file itself: offsets 0x00 through the last
+ * register this driver touches, P_WRITE_ADDR3, inclusive of its long.  It is
+ * derived from that offset rather than written out, so adding a higher register
+ * above cannot leave the mapping short.
+ */
+#define	Z3660_PAGES(b)	(((b) + NBPP - 1) / NBPP)	/* bytes -> pages, rounded up */
+#define	REGS_BYTES	(P_WRITE_ADDR3 + 4)		/* 0x24C: the whole register file */
+#define	REGS_PAGES	Z3660_PAGES( REGS_BYTES)
+#define	BOUNCE_PAGES	Z3660_PAGES( BOUNCE_BYTES)
+
+/*
+ * Compile-time guards on that geometry.  Everything here is an integer macro, so
+ * these are plain preprocessor conditionals -- the only assertion form this
+ * K&R-era target compiler (gcc 2.7.2.3) supports with no generated code at all.
+ *
+ * Each page count is pinned from BOTH sides, because a hardcoded count fails in
+ * both directions as the page size moves: too few pages leaves the tail of the
+ * window unmapped, too many burns sptmap entries (the scarce resource this
+ * driver's direct-map path exists to stop spending).  Together the pair asserts
+ * count == ceil(bytes / NBPP) exactly.  Neither can fire while the counts stay
+ * derived; that is the point -- they fire the moment someone re-hardcodes one,
+ * which is exactly how the span became page-size-dependent in the first place.
+ */
+#if	BOUNCE_BYTES < MAXXFER
+#error	"z3660: one MAXXFER chunk must fit the firmware bounce aperture"
+#endif
+#if	(BOUNCE_PAGES * NBPP) < BOUNCE_SPAN
+#error	"z3660: BOUNCE_PAGES does not cover BOUNCE_SPAN -- derive it, do not hardcode it"
+#endif
+#if	((BOUNCE_PAGES - 1) * NBPP) >= BOUNCE_SPAN
+#error	"z3660: BOUNCE_PAGES over-covers BOUNCE_SPAN -- wasted sptmap pages"
+#endif
+#if	(REGS_PAGES * NBPP) < REGS_BYTES
+#error	"z3660: REGS_PAGES does not cover the piscsi register file"
+#endif
+#if	((REGS_PAGES - 1) * NBPP) >= REGS_BYTES
+#error	"z3660: REGS_PAGES over-covers the piscsi register file"
+#endif
+/*
+ * Z3660_WINDOW_TOP is a FIRMWARE byte bound (the top of the 64KB aperture at
+ * board+0x80000), so it must evaluate to the same address on every page size.
+ * This is the guard that would have caught the old page-count-primary shape: on a
+ * 4KB-page kernel that spelling made the window top 0x000A0000.
+ */
+#if	Z3660_WINDOW_TOP != 0x00090000
+#error	"z3660: the board window top must not vary with NBPP"
+#endif
+/*
+ * sptalloc() maps by FRAME (phystopfn() truncates), so a board offset that is not
+ * page-aligned would silently map a window shifted down to the frame boundary.
+ * True for every page size up to 0x2000; assert it rather than assume it.
+ */
+#if	(PISCSI_OFFSET % NBPP) != 0 || (BOUNCE_OFFSET % NBPP) != 0
+#error	"z3660: board window offsets must be page-aligned"
+#endif
 
 /* SCSI opcodes we interpret */
 #define	C_TUR		0x00
@@ -231,8 +308,9 @@ int	s;
  * a HARDCODED 2048-page (4 MB) resource map that page[] -- sized by presented RAM
  * -- is carved out of first, so its free runs shrink as RAM grows (this is what
  * made the sibling z3660eth driver's 65-page mapping fail past ~83 MB, printing
- * "no Z3660 ethernet found" for a perfectly visible board).  The 33 pages here
- * (1 register + BOUNCE_PAGES) were sitting inside that budget for no reason.
+ * "no Z3660 ethernet found" for a perfectly visible board).  The pages here
+ * (REGS_PAGES + BOUNCE_PAGES -- 33 on this NBPP=2048 kernel) were sitting inside
+ * that budget for no reason.
  *
  * BOTH windows can go direct because BOTH are board apertures, not kernel RAM.
  * The register window is obvious.  The bounce buffer is the subtler one: despite
@@ -286,7 +364,7 @@ z3660map()
 		bounce = (volatile uchar *)phystokv( (paddr_t)base + BOUNCE_OFFSET);
 	} else {
 		z3660_direct_map = 0;
-		regs   = (volatile uchar *)sptalloc( 1, PG_V,
+		regs   = (volatile uchar *)sptalloc( REGS_PAGES, PG_V,
 				phystopfn( (paddr_t)base + PISCSI_OFFSET), 0);
 		bounce = (volatile uchar *)sptalloc( BOUNCE_PAGES, PG_V,
 				phystopfn( (paddr_t)base + BOUNCE_OFFSET), 0);
