@@ -1,3 +1,26 @@
+## 2026-08-18 — z3660: page-size-agnostic board-window geometry (0bd3f10)
+
+The driver stated its window geometry as a page COUNT (BOUNCE_PAGES 32, span = BOUNCE_PAGES *
+NBPP), which reads as page-size-aware but is inverted: the fixed quantity is the firmware's 64KB
+bounce aperture at board+0x80000, and the page count is what must move when NBPP does. On a
+4KB-page kernel the same source silently keeps 32 pages — BOUNCE_SPAN doubles to 0x20000 and
+Z3660_WINDOW_TOP moves to 0x000A0000, i.e. 32 sptmap pages claimed where 16 suffice (the same
+scarce 2048-page map whose exhaustion broke z3660eth past ~83MB) and a direct-map admission test
+64KB wider than the window the firmware has. Inverted: BOUNCE_BYTES (0x10000) is primary,
+BOUNCE_PAGES = Z3660_PAGES(BOUNCE_BYTES) rounded up, BOUNCE_SPAN stays 0x10000 at any page size.
+The register window's unnamed page count (the literal 1 passed to sptalloc) got the same
+treatment — REGS_BYTES = P_WRITE_ADDR3 + 4, REGS_PAGES derived from it. Byte quantities that never
+carried an NBPP term are unchanged; Z3660_NUNITS and Z3660_CQ are a register-array depth and a
+FIFO depth, not page quantities, and stay counts. Seven #if/#error guards pin the result: each
+page count asserted from BOTH sides (count == ceil(bytes/NBPP), so re-hardcoding is a compile
+error in either direction), Z3660_WINDOW_TOP asserted 0x00090000 independently of NBPP, both board
+offsets asserted page-aligned (sptalloc maps by frame, phystopfn truncates), one MAXXFER chunk
+asserted to fit the aperture. Evaluated with the target compiler: NBPP 2048 → 32 / 0x10000, NBPP
+4096 → 16 / 0x10000 (pre-change: 32 / 0x20000). No behavioural change on the shipping kernel — the
+cross-compiled object is BYTE-IDENTICAL to the previous one, nm -u unchanged (autocon, bcopy,
+sptalloc). 77/77 gating + 6/6 parity, and 77/77 again with the harness page size set to 4096.
+Reaches the box at the next kernel relink.
+
 ## 2026-08-17 — z3660: per-unit static-geometry cache — 10 → 6 round trips per 2KB READ (29b2482)
 
 A piscsi register access is a CROSS-CORE ROUND TRIP, not a bus cycle: core1 (the guest's own
