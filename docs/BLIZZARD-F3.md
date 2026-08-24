@@ -9,6 +9,17 @@ Confidence tags follow the campaign convention: **measured** (a line of source r
 number off a run, with its file), **derived** (arithmetic over measured facts, shown), and
 **assumed** (neither — each one below names the gate that settles it).
 
+> **ROUND-1 RESULT (2026-08-24, appended — nothing above was edited to match it).**
+> M0 and M1 implemented and landed. Cross-compiled with the real AMIX toolchain
+> (gcc 2.7.2.3 / GNU as 2.8.1, the shipped `AMIX_KERNEL_CFLAGS`): `nm -u` unchanged but for
+> `printf`; the four 040/060-only instruction sites (`movec` ×3, `cpushl`+`cinvl`, `cinvl`,
+> `nop`) each proven dominated by a `tstl z3660_cache` / `beq` in the disassembly. The
+> comment-only correction commit is proven **byte-identical** at the object level. Host
+> harness **95 gating passed / 0 failed** (was 77/0) and 6/6 oracle parity, with the 18 new
+> gates covering the gate-off path, each maintenance boundary, the READ-bounce
+> no-invalidate rule, the S11 census, and both arms of the M0 assertion.
+> **Nothing here is evidence about a real cache** — §7 is still owed, on metal.
+
 ---
 
 ## 0. Why this driver has never needed a cache instruction

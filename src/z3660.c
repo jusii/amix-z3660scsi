@@ -423,8 +423,11 @@ ulong	t, a;
  * Returns 0 to continue, ENXIO to refuse the attach (only when z3660_ci_enforce
  * is set: a first-silicon boot that refuses its own root device tells you
  * nothing, so the default is to measure loudly and carry on).
+ *
+ * Non-static so the host harness can drive BOTH arms: a check only ever
+ * exercised on its passing arm is not a check.
  */
-static int
+int
 z3660_ci_check( lo, hi)
 ulong	lo, hi;			/* board window: lo inclusive, hi exclusive */
 {
@@ -469,6 +472,139 @@ ulong	lo, hi;			/* board window: lo inclusive, hi exclusive */
 	printf( "z3660: cache-inhibit assertion FAILED (cache=%d cacr 0x%x)\n",
 		(int)z3660_cache, z3660_cacr);
 	return z3660_ci_enforce ? ENXIO : 0;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * F3-M1 -- the maintenance itself.
+ * ---------------------------------------------------------------------------
+ *
+ * Line ops as raw .word, verified against this toolchain by disassembly:
+ *   f468 = cpushl dc,%a0@     f448 = cinvl dc,%a0@     4e71 = nop
+ *
+ * WHY EVERY PUSH IS FOLLOWED BY AN INVALIDATE.  On the 68040 CPUSHL pushes AND
+ * invalidates.  On the 68060 that invalidation is conditional on CACR.DPI --
+ * clear pushes and invalidates, set pushes and leaves the line VALID.  The port
+ * lane's own DMA contract (docs/contracts/A3091-B2-PREPARE-PATCH-SPEC.md) records
+ * the explicit CINVL as harmless on the 040 and recommends it wherever invalid
+ * state is part of the contract, which it is here.  One unconditional sequence is
+ * then correct on both parts with no CPU-class branch, and CACR is captured at
+ * attach so a set DPI is visible rather than inferred.
+ *
+ * WHY PUSH BEFORE, NEVER INVALIDATE AFTER, ON ANYTHING THE CPU WRITES.  CINVL
+ * DISCARDS a dirty line without writing it back.  These ranges round outward to
+ * 16-byte lines that also cover bytes this driver never touched; invalidating
+ * after would throw away whatever else lived in those lines.  CPUSHL writes them
+ * back first, so it is safe on a partial line where CINVL is not.
+ */
+ulong	z3660_push_n, z3660_inv_n;		/* line-op invocations                 */
+ulong	z3660_push_bytes, z3660_inv_bytes;	/* bytes covered (pre-rounding)        */
+ulong	z3660_bounce_wr_n;			/* WRITE staging fired -- expect 0     */
+ulong	z3660_bounce_rd_n;			/* READ came back via the bounce       */
+ulong	z3660_pagecross_n;			/* chunks spanning a page boundary     */
+ulong	z3660_range_ovf;			/* impossible range refused            */
+
+#ifndef	HOST_TEST
+#define	Z3660_CPUSHL(p)	__asm__ __volatile__( ".word 0xf468" : : "a" (p) : "memory")
+#define	Z3660_CINVL(p)	__asm__ __volatile__( ".word 0xf448" : : "a" (p) : "memory")
+#define	Z3660_NOP()	__asm__ __volatile__( ".word 0x4e71" : : : "memory")
+#define	Z3660_LINEPTR	register uchar *p __asm__("a0")
+#else	/* the harness has no m68k cache to maintain; the ranging logic is still
+	 * walked, and the counters still move, so both are testable on the host. */
+#define	Z3660_CPUSHL(p)	((void)(p))
+#define	Z3660_CINVL(p)	((void)(p))
+#define	Z3660_NOP()	((void)0)
+#define	Z3660_LINEPTR	uchar *p
+#endif
+
+/*
+ * Push-and-invalidate every line covering [pa, pa+len).  `pa` is a PHYSICAL
+ * address -- which is what this driver holds anyway (cp->addr is physical by
+ * contract, NOTES.md 2026-07-11 (a)) and exactly what the line ops want: they
+ * select by physical line on a physically-tagged cache, so one op covers EVERY
+ * virtual alias of that RAM, including the copyback user mapping a raw-I/O
+ * buffer actually lives in.  No vtop, no bp_map, no alias bookkeeping.
+ */
+static void
+z3660_push( pa, len)
+ulong	pa, len;
+{
+	Z3660_LINEPTR;
+	ulong	end;
+
+	if (z3660_cache == 0 || len == 0)
+		return;
+	if (pa + len < pa) {			/* wrap: refuse rather than loop wild */
+		z3660_range_ovf++;
+		return;
+	}
+	p   = (uchar *)(pa & ~15UL);
+	end = (pa + len + 15) & ~15UL;
+	while ((ulong)p < end) {
+		Z3660_CPUSHL( p);
+		Z3660_CINVL( p);
+		p += 16;
+	}
+	z3660_push_n++;
+	z3660_push_bytes += len;
+}
+
+/*
+ * Invalidate every line covering [pa, pa+len) -- FROM_DEVICE completion only,
+ * and only on the direct-DMA arm.
+ *
+ * The outward rounding is safe HERE in a way it is not in general: the same
+ * range was pushed-and-invalidated before the transfer was armed, the whole
+ * transaction runs at spl6, the mailbox op is synchronous, and the 040/060 data
+ * cache does not prefetch -- so no line covering the range can be dirty when
+ * this runs, and the invalidate cannot discard anything.  That argument is the
+ * thing that stops being true if this driver ever becomes asynchronous.
+ */
+static void
+z3660_inv( pa, len)
+ulong	pa, len;
+{
+	Z3660_LINEPTR;
+	ulong	end;
+
+	if (z3660_cache == 0 || len == 0)
+		return;
+	if (pa + len < pa) {
+		z3660_range_ovf++;
+		return;
+	}
+	p   = (uchar *)(pa & ~15UL);
+	end = (pa + len + 15) & ~15UL;
+	while ((ulong)p < end) {
+		Z3660_CINVL( p);
+		p += 16;
+	}
+	z3660_inv_n++;
+	z3660_inv_bytes += len;
+}
+
+/*
+ * S4 -- the doorbell/readback ordering barrier.
+ *
+ * DTT0 is CM=11, cache-inhibited NONSERIALIZED, so the doorbell write and the
+ * USED_DMA read that follows it are ordered only because the 060 store buffer is
+ * currently OFF (CACR bit 29; 060-D-CACHE-KNOBS-PLAN.md lists turning it on as
+ * candidate 1).  The moment that knob lands, the read could overtake a buffered
+ * doorbell and return the PREVIOUS transaction's USED_DMA -- which would send the
+ * driver down the wrong completion arm, silently.
+ *
+ * The barrier is placed now, gated, so it is in the code before the hazard is
+ * armed.  It costs nothing today.  THAT `nop` SERIALIZES PENDING WRITES ON THE
+ * 68060 IS ASSUMED, NOT MEASURED: the claim is owed a read of the MC68060UM
+ * before the store-buffer rung, on the same discipline that made F1-M0 settle
+ * PCR bit 1 from the manual before any PCR code shipped.
+ */
+static void
+z3660_sync()
+{
+	if (z3660_cache == 0)
+		return;
+	Z3660_NOP();
 }
 
 static int
@@ -805,7 +941,7 @@ int	unit, write;
 ulong	block, blocks, bs;
 uchar	*data;
 {
-	ulong	chunk, len, i, perchunk;
+	ulong	chunk, len, i, perchunk, pa;
 
 	perchunk = MAXXFER / bs;
 	if (perchunk == 0)
@@ -814,22 +950,75 @@ uchar	*data;
 	while (blocks > 0) {
 		chunk = (blocks < perchunk) ? blocks : perchunk;
 		len   = chunk * bs;
+		pa    = (ulong)data;
+
+		/*
+		 * S11 census (docs/BLIZZARD-F3.md 3.4).  cp->addr is ONE vtop(),
+		 * valid for exactly one page, and the firmware transfers len bytes
+		 * LINEARLY from it -- while kmem is virtually contiguous and
+		 * PHYSICALLY SCATTERED, so a chunk running past the page end writes
+		 * an unrelated frame.  That is the 2026-07-13 cdfs wild write, and
+		 * amix-cdfs refuses it outright (amix_kern_media.c:196-201).
+		 *
+		 * This round COUNTS and does NOT refuse, deliberately.  The raw path
+		 * is broken up by amiga_dma_pageio() and the belief is that every
+		 * request is page-bounded -- but that belief has never been
+		 * instrumented, and this driver is the root device of two kernel
+		 * lines.  Refusing on an untested belief risks more than it buys.
+		 * The counter decides, in either direction: 0 across a boot and an
+		 * install makes the guard a permanent refusal; non-zero means the
+		 * shipping path needs the chunk SPLIT at the page boundary, not
+		 * refused.
+		 */
+		if ((pa & (ulong)(NBPP - 1)) + len > (ulong)NBPP)
+			z3660_pagecross_n++;
 
 		if (write) {
-			if ((ulong)data < BOUNCE_THRESH)
+			/*
+			 * TO_DEVICE prepare.  Before the staging bcopy as well as
+			 * before the doorbell: that bcopy READS `data` through the
+			 * cache-inhibited alias, so it would stage stale RAM if a
+			 * dirty alias line held newer bytes.
+			 */
+			z3660_push( pa, len);
+			if (pa < BOUNCE_THRESH) {
+				z3660_bounce_wr_n++;	/* unreachable on AMIX RAM */
 				bcopy( (caddr_t)data, (caddr_t)bounce, (int)len);
+			}
 			WRLONG( P_WRITE_ADDR1, block);
 			WRLONG( P_WRITE_ADDR2, len);
-			WRLONG( P_WRITE_ADDR3, (ulong)data);
+			WRLONG( P_WRITE_ADDR3, pa);
 			WRLONG( P_WRITE, unit);			/* trigger (sync) */
+			/* no completion op: TO_DEVICE never invalidates */
 		} else {
+			/*
+			 * FROM_DEVICE prepare: no dirty line may survive to be
+			 * evicted over the fresh bytes afterwards, and no stale
+			 * valid line may survive to be read instead of them.
+			 */
+			z3660_push( pa, len);
 			WRLONG( P_READ_ADDR1, block);
 			WRLONG( P_READ_ADDR2, len);
-			WRLONG( P_READ_ADDR3, (ulong)data);
+			WRLONG( P_READ_ADDR3, pa);
 			WRLONG( P_READ, unit);			/* trigger (sync) */
+			z3660_sync();		/* S4: doorbell must precede the readback */
 			z3660_dma = RDLONG( P_USED_DMA);
-			if (z3660_dma != 0)
+			if (z3660_dma != 0) {
+				/*
+				 * BOUNCE arm -- the CPU writes `data`, through the
+				 * CI alias, and the prepare above left no cached
+				 * line covering it, so it is already coherent.
+				 * MUST NOT invalidate here: a 16-byte-rounded cinvl
+				 * over a CPU-written range would discard the bytes
+				 * just written along with their line neighbours.
+				 */
+				z3660_bounce_rd_n++;
 				bcopy( (caddr_t)bounce, (caddr_t)data, (int)len);
+			} else {
+				/* DIRECT arm -- the ARM wrote RAM behind the CPU's
+				 * back; invalidate before any consumer reads it. */
+				z3660_inv( pa, len);
+			}
 		}
 
 		block  += chunk;
@@ -986,6 +1175,32 @@ struct sdcom	*cp;
 	cp->status = 0;			/* default GOOD */
 	cp->okay   = TRUE;
 	write      = 0;
+
+	/*
+	 * S8 -- the synthesised responses below (REQUEST SENSE 18, INQUIRY 36,
+	 * READ CAPACITY 8, MODE SENSE(6) 12, MODE SENSE(10) 16 bytes) are written
+	 * into the caller's buffer by the CPU, through the cache-inhibited low
+	 * alias, and read back by the consumer through whatever alias it owns.
+	 * Push-and-invalidate FIRST, so any dirty line covering the range reaches
+	 * RAM (preserving the neighbours that share these sub-cache-line ranges)
+	 * and no stale line survives to be served instead.  Never invalidate AFTER
+	 * a CPU-written range: see docs/BLIZZARD-F3.md 3.2.
+	 *
+	 * Block READ/WRITE are absent from this list on purpose -- their
+	 * maintenance is per chunk, at the DMA boundary inside z3660_rw().
+	 */
+	switch (op) {
+	case C_REQ_SENSE:
+	case C_INQUIRY:
+	case C_READ_CAP10:
+	case C_MODE_SENSE6:
+	case C_MODE_SENSE10:
+		if (data && cp->nbyte)
+			z3660_push( (ulong)data, (ulong)cp->nbyte);
+		break;
+	default:
+		break;
+	}
 
 	switch (op) {
 	case C_TUR:

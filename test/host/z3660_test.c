@@ -759,6 +759,195 @@ static void test_completion_trampoline()
 }
 
 /* ====================================================================== */
+/* ------------------------------------------------------------------------
+ * BLIZZARD F3 -- cache-maintenance boundaries (docs/BLIZZARD-F3.md)
+ *
+ * What this CAN prove on a host: that the gate really gates, that the ops land
+ * at the right boundaries and only there, that the READ bounce arm does NOT
+ * invalidate (the trap that would destroy data), and that the free-ride
+ * assertion fails when the free ride is taken away.
+ *
+ * What it CANNOT prove: anything about a real cache.  There isn't one here, and
+ * Amiberry has none either -- only the 68060 can score correctness, by the
+ * canary protocol pre-registered in docs/BLIZZARD-F3.md section 7.
+ *
+ * Note on coverage: the mock sets USED_DMA to the buffer address, so every
+ * harness READ takes the BOUNCE arm.  The direct-DMA arm's invalidate is
+ * therefore unreachable here by construction, and is covered by disassembly
+ * plus the metal protocol instead.
+ * ------------------------------------------------------------------------ */
+extern long		z3660_cache, z3660_ci_enforce;
+extern unsigned long	z3660_push_n, z3660_inv_n;
+extern unsigned long	z3660_push_bytes, z3660_inv_bytes;
+extern unsigned long	z3660_bounce_wr_n, z3660_bounce_rd_n;
+extern unsigned long	z3660_pagecross_n, z3660_range_ovf;
+extern unsigned long	z3660_ci_ok, z3660_sptalloc_unsafe;
+extern unsigned long	z3660_test_dtt0, z3660_test_dtt1;
+extern int		z3660_ci_check();
+
+/*
+ * The harness .c files deliberately do NOT get -Istubs (they see the real system
+ * headers), so the page size is restated here.  It must match NBPP in
+ * stubs/sys/immu.h; if it stops matching, the page-cross gate below fails loudly
+ * rather than silently measuring nothing.
+ */
+#define	F3_NBPP		2048
+
+static uchar	f3buf[16384];
+
+static void f3_zero()
+{
+	z3660_push_n = z3660_inv_n = z3660_push_bytes = z3660_inv_bytes = 0;
+	z3660_bounce_wr_n = z3660_bounce_rd_n = 0;
+	z3660_pagecross_n = z3660_range_ovf = 0;
+}
+
+/* one INQUIRY / READ(10) / WRITE(10) triple against U_DISK, into `p` */
+static void f3_triple( p)
+uchar	*p;
+{
+	uchar	cdb[10];
+
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x12; cdb[4] = 36;			/* INQUIRY 36 */
+	run_cmd( U_DISK, cdb, 6, p, 36);
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x28; cdb[8] = 1;			/* READ(10) 1 block */
+	run_cmd( U_DISK, cdb, 10, p, (unsigned)DK_BS);
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x2A; cdb[8] = 1;			/* WRITE(10) 1 block */
+	run_cmd( U_DISK, cdb, 10, p, (unsigned)DK_BS);
+}
+
+static void test_f3_cache()
+{
+	uchar		*p, *cross;
+	uchar		cdb[10];
+	unsigned long	save0, save1;
+	int		saved_map;
+
+	printf("\n=== GATE: F3 cache maintenance -- gate, boundaries, bounce arm ===\n");
+
+	/* ---- 1. the shipping default: no line op is reachable at all ---- */
+	z3660_cache = 0;
+	f3_zero();
+	f3_triple( f3buf);
+	CHECK( z3660_push_n == 0 && z3660_inv_n == 0,
+	       "z3660_cache=0: no cache line op on any path (the shipping default)");
+	printf("       cache=0: push_n=%lu inv_n=%lu bounce_rd=%lu\n",
+	       z3660_push_n, z3660_inv_n, z3660_bounce_rd_n);
+
+	/* ---- 2. armed: the ops land at the boundaries, and only there ---- */
+	z3660_cache = 60;
+
+	f3_zero();					/* INQUIRY alone */
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x12; cdb[4] = 36;
+	run_cmd( U_DISK, cdb, 6, f3buf, 36);
+	CHECK( z3660_push_n == 1 && z3660_push_bytes == 36,
+	       "synthesised INQUIRY: exactly one push, over exactly nbyte");
+	CHECK( z3660_inv_n == 0,
+	       "synthesised INQUIRY: never invalidated (would discard CPU writes)");
+
+	f3_zero();					/* READ(10), one chunk */
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x28; cdb[8] = 1;
+	run_cmd( U_DISK, cdb, 10, f3buf, (unsigned)DK_BS);
+	CHECK( z3660_push_n == 1 && z3660_push_bytes == DK_BS,
+	       "READ(10): FROM_DEVICE prepare pushes the chunk before the doorbell");
+	CHECK( z3660_bounce_rd_n == 1,
+	       "READ(10): the mock returns USED_DMA, so the bounce arm ran");
+	CHECK( z3660_inv_n == 0,
+	       "READ(10) BOUNCE arm: NO invalidate -- it would discard the bcopy");
+
+	f3_zero();					/* WRITE(10), one chunk */
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x2A; cdb[8] = 1;
+	run_cmd( U_DISK, cdb, 10, f3buf, (unsigned)DK_BS);
+	CHECK( z3660_push_n == 1 && z3660_push_bytes == DK_BS,
+	       "WRITE(10): TO_DEVICE prepare pushes the chunk before the doorbell");
+	CHECK( z3660_inv_n == 0,
+	       "WRITE(10): TO_DEVICE never invalidates at completion");
+	CHECK( z3660_bounce_wr_n == 0,
+	       "WRITE(10): the driver-side staging branch stays unreachable");
+
+	/* ---- 3. multi-chunk: one prepare per chunk, not per command ---- */
+	f3_zero();
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x28; cdb[8] = 4;			/* 4 blocks, still one chunk */
+	run_cmd( U_DISK, cdb, 10, f3buf, (unsigned)(4 * DK_BS));
+	CHECK( z3660_push_n == 1 && z3660_push_bytes == 4 * DK_BS,
+	       "READ(10) x4 blocks: one prepare covering the whole chunk");
+
+	/* ---- 4. the S11 page-cross census counts, and does NOT refuse ---- */
+	f3_zero();
+	p = f3buf;					/* land 64 bytes below a page end */
+	cross = p + ((F3_NBPP - ((unsigned long)p & (F3_NBPP - 1))) & (F3_NBPP - 1));
+	cross = cross - 64;
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x28; cdb[8] = 1;			/* 512B from 64B before a page end */
+	run_cmd( U_DISK, cdb, 10, cross, (unsigned)DK_BS);
+	CHECK( z3660_pagecross_n == 1,
+	       "S11: a chunk spanning a page boundary is counted");
+	CHECK( g_okay == TRUE,
+	       "S11: and is NOT refused this round (census only -- see BLIZZARD-F3 3.4)");
+
+	f3_zero();					/* page-aligned: no count */
+	p = f3buf + ((F3_NBPP - ((unsigned long)f3buf & (F3_NBPP - 1))) & (F3_NBPP - 1));
+	memset( cdb, 0, sizeof cdb);
+	cdb[0] = 0x28; cdb[8] = 1;
+	run_cmd( U_DISK, cdb, 10, p, (unsigned)DK_BS);
+	CHECK( z3660_pagecross_n == 0,
+	       "S11: an in-page chunk is not counted");
+
+	/* ---- 5. the census is UNGATED: it must run on the shipping boxes ---- */
+	z3660_cache = 0;
+	f3_zero();
+	run_cmd( U_DISK, cdb, 10, cross, (unsigned)DK_BS);
+	CHECK( z3660_pagecross_n == 1 && z3660_push_n == 0,
+	       "S11 census runs with the cache gate OFF (that is where it is read)");
+
+	/* ---- 6. F3-M0: the free-ride assertion, both arms ---- */
+	save0 = z3660_test_dtt0;
+	save1 = z3660_test_dtt1;
+	z3660_cache      = 60;
+	z3660_ci_enforce = 0;
+
+	z3660_ci_ok = 0;
+	CHECK( z3660_ci_check( 0x10000000UL, 0x10090000UL) == 0 && z3660_ci_ok == 1,
+	       "M0: shipped DTT0 0x003fc060 passes the free-ride check");
+
+	z3660_test_dtt0 = 0x003fc000;		/* CM=00: cacheable write-through */
+	z3660_ci_ok = 0;
+	CHECK( z3660_ci_check( 0x10000000UL, 0x10090000UL) == 0 && z3660_ci_ok == 2,
+	       "M0: a CACHEABLE covering TTR fails the check");
+
+	z3660_test_dtt0 = 0x003f4060;		/* E=0: covers nothing */
+	z3660_ci_ok = 0;
+	CHECK( z3660_ci_check( 0x10000000UL, 0x10090000UL) == 0 && z3660_ci_ok == 2,
+	       "M0: an address no enabled TTR covers fails the check");
+
+	z3660_test_dtt0  = 0x003fc060;		/* good again, but enforce refuses */
+	z3660_ci_enforce = 1;
+	z3660_ci_ok = 0;
+	saved_map = (int)z3660_direct_map;
+	z3660_direct_map = 0;			/* pretend the sptalloc arm was taken */
+	CHECK( z3660_ci_check( 0x10000000UL, 0x10090000UL) != 0 && z3660_ci_ok == 2
+	       && z3660_sptalloc_unsafe == 1,
+	       "M0: the sptalloc arm is refused when enforcement is on");
+	z3660_direct_map = (unsigned char)saved_map;
+
+	/* ---- restore the shipping posture for anything that follows ---- */
+	z3660_test_dtt0  = save0;
+	z3660_test_dtt1  = save1;
+	z3660_cache      = 0;
+	z3660_ci_enforce = 0;
+	z3660_sptalloc_unsafe = 0;
+	f3_zero();
+	printf("       restored: cache=%ld ci_enforce=%ld\n",
+	       z3660_cache, z3660_ci_enforce);
+}
+
 int main()
 {
 	mock_reset();
@@ -786,6 +975,8 @@ int main()
 
 	test_reentry();
 	test_completion_trampoline();
+
+	test_f3_cache();
 
 	stretch_cd_parity();
 
