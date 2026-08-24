@@ -24,9 +24,17 @@
  * Protocol (board_base-relative, all 32-bit MMIO):
  *   register window  = board_base + 0x2000  (commands written/read as longs at
  *                      regs + cmd_offset)
- *   bounce buffer    = board_base + 0x80000 (<=64KB, for transfers the ARM cannot
- *                      DMA directly -- which in EMU/030 mode is ALWAYS, and Amix RAM
- *                      is < 0x08000000 so the firmware always bounces)
+ *   bounce buffer    = board_base + 0x80000 (<=64KB, the firmware's staging area
+ *                      for transfers it cannot DMA directly)
+ *
+ *   CORRECTION 2026-08-24 (BLIZZARD F3): this comment used to claim "Amix RAM is
+ *   < 0x08000000 so the firmware always bounces".  That is FALSE and it is
+ *   load-bearing: AMIX_RAM_GUEST_BASE IS 0x08000000 (Z3660 src/amix_ram.h:41), so
+ *   every AMIX physical address is at or above the threshold and NOTHING in AMIX
+ *   RAM is ever staged by the driver -- the firmware DMAs straight into 68k RAM.
+ *   Every "the bounce keeps us coherent" argument built on that sentence is void,
+ *   which is why this driver needs real CPU cache maintenance on real silicon.
+ *   See docs/BLIZZARD-F3.md.
  *
  *   A block READ/WRITE is:  write DRVNUMX(unit); write the operation's OWN address
  *   triple (read/write use separate registers, never shared) -- READ_ADDR1/2/3 =
@@ -73,7 +81,17 @@
 #define	BOUNCE_OFFSET	0x00080000	/* bounce buffer within the board */
 #define	BOUNCE_BYTES	0x00010000	/* size of that bounce aperture: 64KB */
 #define	MAXXFER		65536		/* max bytes per piscsi op */
-#define	BOUNCE_THRESH	0x08000000	/* buffers below this are bounced by the ARM */
+/*
+ * The WRITE-side staging threshold.  Its VALUE is right; the reason written
+ * beside it for a year was not.  0x08000000 is AMIX_RAM_GUEST_BASE (Z3660
+ * src/amix_ram.h:41) -- the BASE of AMIX RAM, not a ceiling -- so this test does
+ * not mean "the firmware bounces AMIX RAM" (it never does, see the header
+ * correction).  It means "this address is below AMIX RAM entirely", i.e. not
+ * something the firmware can reach, and staging it is the conservative answer.
+ * On every shipping configuration the branch is unreachable; z3660_bounce_wr_n
+ * exists so that "unreachable" is measured rather than believed.
+ */
+#define	BOUNCE_THRESH	0x08000000	/* = AMIX_RAM_GUEST_BASE: below this is not AMIX RAM */
 /*
  * Board-window geometry is expressed in BYTES, because every quantity above is a
  * fact about the FIRMWARE's address map (Z3660 src/memorymap.h), not about this
@@ -329,9 +347,27 @@ int	s;
  * VSECT1, so a board based just under the boundary still takes the mapped path
  * rather than running off the end of section 0.
  *
- * Cache semantics are identical either way: section 0 carries CI clear, and the
- * sptalloc path could never have been cache-inhibited either -- this kernel has
- * no PG_CI bit at all (immu.h defines only PG_ADDR/PG_LOCK/PG_M/PG_REF/PG_W/PG_V).
+ * CACHE SEMANTICS -- CORRECTED 2026-08-24 (BLIZZARD F3).  This paragraph used to
+ * say the two arms were identical because "this kernel has no PG_CI bit at all".
+ * That is a 68030 fact (stock immu.h defines only PG_ADDR/PG_LOCK/PG_M/PG_REF/
+ * PG_W/PG_V) restated as a universal one, and on the 040/060 kernel line it is
+ * false: a leaf PTE there carries a two-bit CM field at bits 6-5 which the kernel
+ * already writes (hat_cm_ram = 0x20 copyback for managed RAM; u-area leaf 0x60 =
+ * noncachable).  The two arms are NOT alike:
+ *
+ *   DIRECT arm (below VSECT1, the shipped config): the board window is reached
+ *   through the low identity alias, and pstart040.s:326 sets DTT0 = 0x003fc060 --
+ *   the whole low 1 GB cache-inhibited for DATA.  The mailbox and the bounce
+ *   aperture are CI for free.  This driver depends on that, so as of F3-M0 it
+ *   ASSERTS it at attach (z3660_ci_check) instead of assuming it.
+ *
+ *   SPTALLOC arm (board at/above VSECT1, i.e. autoconfig_rtg YES): the mapping is
+ *   page-table-backed, and per-map device CM is still hat040.s's deferred TODO --
+ *   so the window would take hat_cm_ram, i.e. COPYBACK, and the mailbox would be
+ *   cacheable.  That is not a slow driver, it is a broken one.  This arm is
+ *   therefore UNSUPPORTED on real 040/060 silicon until that TODO lands; it is
+ *   detected and counted (z3660_sptalloc_unsafe), not silently taken.
+ *
  * Neither mapping was ever freed, on either path.
  */
 static int
