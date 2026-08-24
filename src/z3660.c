@@ -269,6 +269,208 @@ static uchar	z3660_sense_key, z3660_sense_asc, z3660_sense_ascq;
  */
 ulong	z3660_nest_depth, z3660_nest_hits;
 
+/*
+ * ---------------------------------------------------------------------------
+ * BLIZZARD F3 -- CPU data-cache coherence on real 68040/68060 silicon.
+ * Full rationale, suspect table and metal protocol: docs/BLIZZARD-F3.md.
+ * ---------------------------------------------------------------------------
+ *
+ * WHY THERE WAS NEVER ANY CACHE CODE HERE.  Every deployment of this driver so
+ * far has run on an EMULATED CPU -- the Z3660 carries the guest 030/040 on
+ * core1's interpreter and the socketed 68LC060 is a bus-parked passenger.  An
+ * interpreter has no data cache, so the maintenance this file never did cost
+ * nothing.  BLIZZARD F4 puts this code on silicon that has caches, and there
+ * the same program is wrong in both directions: a WRITE hands the firmware a
+ * physical page whose newest bytes are still in the CPU's cache, and a READ
+ * lets the ARM overwrite a page whose stale dirty lines are evicted over the
+ * fresh bytes afterwards.
+ *
+ * WHAT DOES *NOT* SAVE US.  Three things are routinely mistaken for coherence
+ * here and none of them reaches this class:
+ *   - DTT0 = 0x003fc060 (pstart040.s:326) inhibits the low 1 GB for data, but a
+ *     TTR matches LOGICAL addresses.  It covers THIS DRIVER'S accesses (cp->addr
+ *     is a physical address by contract, dereferenced through the low identity
+ *     alias) and the board window.  It does NOT cover the same physical page's
+ *     other aliases -- and user pages are copyback (hat_cm_ram = 0x20, default
+ *     since 2026-07-30), which is exactly where a raw-I/O buffer lives.
+ *   - /SNOOP covers 68k local-bus cycles only; the piscsi path has the ARM write
+ *     Zynq DDR from its own memory system, which is not a 68k bus cycle at all,
+ *     and on v0.2 boards the net is a no-connect anyway.
+ *   - the bounce buffer.  See the BOUNCE_THRESH correction above: nothing in
+ *     AMIX RAM is ever staged, so there is no copy step to be coherent behind.
+ *
+ * THE GATE.  This file is compiled ONCE, with -m68020, and the one object is
+ * linked into kernels that run on an emulated 030, an emulated 040 and (from F4)
+ * a real 68060.  There is no compile-time discriminator available, and `cputype`
+ * may NOT be referenced -- the stock kernel has no such symbol, so an extern to
+ * it would break the nm -u clean gate on the 030 line.  So the class is a
+ * driver-owned global, default OFF, poked through /dev/kmem exactly like the
+ * port lane's hg_on / i40_on / hat_cm_ram:
+ *
+ *     z3660_cache = 0   no cache instruction is reachable.  THE SHIPPING
+ *                       DEFAULT: every existing image behaves as it always has,
+ *                       for the cost of one tstl/beq per boundary.
+ *                 = 40  real 68040 data cache
+ *                 = 60  real 68060 data cache
+ *
+ * That default is what makes it safe to land this before F4 rather than after,
+ * and it makes F4's proof single-variable: same kernel, same object, flag off
+ * versus flag on.
+ */
+long	z3660_cache;		/* 0 = off (default), 40 = 68040 DC, 60 = 68060 DC */
+long	z3660_ci_enforce;	/* 0 = warn on a failed free-ride check, else refuse */
+
+/* attach-time capture + verdict (all kmem-readable; see docs/BLIZZARD-F3.md §7) */
+ulong	z3660_dtt0, z3660_dtt1, z3660_cacr;
+ulong	z3660_ci_ok;		/* 0 = not checked, 1 = free ride verified, 2 = FAILED */
+ulong	z3660_sptalloc_unsafe;	/* sptalloc arm taken with maintenance armed */
+
+#ifndef	HOST_TEST
+/*
+ * 040/060 control-register reads, as raw .word so the -m68020 assembler accepts
+ * them, with the destination pinned by an explicit register variable.  Verified
+ * against this toolchain (gcc 2.7.2.3 / GNU as 2.8.1) by disassembly:
+ *   4e7a 0006 = movec %dtt0,%d0   4e7a 0007 = movec %dtt1,%d0
+ *   4e7a 0002 = movec %cacr,%d0
+ * Every caller is gated on z3660_cache != 0, so none of this is reachable on the
+ * 68030 line, where these words would take a line-F exception.
+ */
+static ulong
+z3660_rd_dtt0()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0006" : "=d" (v));
+	return v;
+}
+
+static ulong
+z3660_rd_dtt1()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0007" : "=d" (v));
+	return v;
+}
+
+static ulong
+z3660_rd_cacr()
+{
+	register ulong	v __asm__("d0");
+
+	__asm__ __volatile__( ".word 0x4e7a,0x0002" : "=d" (v));
+	return v;
+}
+#else	/* HOST_TEST: the harness supplies the register values so BOTH arms of the
+	 * free-ride check can be driven -- a check only ever exercised on its
+	 * passing arm is not a check. */
+ulong	z3660_test_dtt0 = 0x003fc060;	/* the shipped pstart040.s value */
+ulong	z3660_test_dtt1 = 0x807fa060;
+ulong	z3660_test_cacr = 0x80008000;
+static ulong z3660_rd_dtt0() { return z3660_test_dtt0; }
+static ulong z3660_rd_dtt1() { return z3660_test_dtt1; }
+static ulong z3660_rd_cacr() { return z3660_test_cacr; }
+#endif	/* HOST_TEST */
+
+/*
+ * Classify one transparent-translation register against one address, for
+ * SUPERVISOR DATA accesses:
+ *   0 = does not cover this address
+ *   1 = covers it, cache-inhibited      (the free ride)
+ *   2 = covers it, CACHED               (the free ride is gone)
+ *
+ * TTR layout (040 and 060 alike; decode confirmed by pstart040.s's own comments,
+ * which call ITT0 0x003fc000 "WT-cacheable" and DTT1 0x807fa060 "cache-inhib",
+ * and record that serializing DTT0 meant CM 0x60 -> 0x40):
+ *   31-24 base   23-16 mask   15 E   14-13 S   6-5 CM   (CM: 0 WT, 1 copyback,
+ *   2 CI-serialized, 3 CI-nonserialized)
+ */
+static int
+z3660_ttr_class( t, a)
+ulong	t, a;
+{
+	ulong	base, mask, s, cm;
+
+	if ((t & 0x8000) == 0)			/* E: disabled TTRs cover nothing */
+		return 0;
+	s = (t >> 13) & 3;			/* 0 = user only, 1 = supervisor only, 2/3 = both */
+	if (s == 0)
+		return 0;
+	base = (t >> 24) & 0xFF;
+	mask = (t >> 16) & 0xFF;
+	if ((((a >> 24) & 0xFF) & ~mask) != (base & ~mask))
+		return 0;
+	cm = (t >> 5) & 3;
+	return (cm >= 2) ? 1 : 2;
+}
+
+/*
+ * F3-M0 -- assert the free ride instead of depending on it silently.
+ *
+ * The whole board window must be reached cache-inhibited, or this driver cannot
+ * talk to the mailbox at all on a machine with a live data cache.  Today that is
+ * true by accident of a kernel constant no code here names.  Check it once, at
+ * attach, and say so out loud when it stops being true -- this is what catches a
+ * future kernel that narrows DTT0 (already booked in the port lane as a separate
+ * milestone) before the mailbox starts answering out of a stale cache line.
+ *
+ * The TTR granularity is 16 MB, so a 0x90000-byte window straddles at most one
+ * boundary: checking both endpoints is exhaustive.  A covering-but-cached TTR
+ * fails regardless of which register it is, and an address covered by NO enabled
+ * TTR fails too -- it would fall to the page tables, whose cache mode this
+ * driver cannot read and must not assume.
+ *
+ * Returns 0 to continue, ENXIO to refuse the attach (only when z3660_ci_enforce
+ * is set: a first-silicon boot that refuses its own root device tells you
+ * nothing, so the default is to measure loudly and carry on).
+ */
+static int
+z3660_ci_check( lo, hi)
+ulong	lo, hi;			/* board window: lo inclusive, hi exclusive */
+{
+	ulong	a;
+	int	i, c0, c1, bad;
+
+	if (z3660_cache == 0) {		/* emulated CPU: nothing to check, nothing to do */
+		z3660_ci_ok = 0;
+		return 0;
+	}
+	z3660_dtt0 = z3660_rd_dtt0();
+	z3660_dtt1 = z3660_rd_dtt1();
+	z3660_cacr = z3660_rd_cacr();
+
+	bad = 0;
+	for (i = 0; i < 2; ++i) {
+		a  = i ? (hi - 1) : lo;
+		c0 = z3660_ttr_class( z3660_dtt0, a);
+		c1 = z3660_ttr_class( z3660_dtt1, a);
+		if (c0 == 2 || c1 == 2 || (c0 == 0 && c1 == 0)) {
+			bad = 1;
+			printf( "z3660: board VA 0x%x is NOT cache-inhibited (dtt0 0x%x dtt1 0x%x)\n",
+				a, z3660_dtt0, z3660_dtt1);
+		}
+	}
+	/*
+	 * The sptalloc arm is a separate failure and a worse one: its window is
+	 * page-table-backed, and per-map device cache mode is still hat040.s's
+	 * deferred TODO, so the mailbox would be mapped COPYBACK.  See the mapping
+	 * note above z3660map().
+	 */
+	if (z3660_direct_map == 0) {
+		z3660_sptalloc_unsafe++;
+		bad = 1;
+		printf( "z3660: sptalloc mapping arm is unsupported with a live data cache\n");
+	}
+	if (bad == 0) {
+		z3660_ci_ok = 1;
+		return 0;
+	}
+	z3660_ci_ok = 2;
+	printf( "z3660: cache-inhibit assertion FAILED (cache=%d cacr 0x%x)\n",
+		(int)z3660_cache, z3660_cacr);
+	return z3660_ci_enforce ? ENXIO : 0;
+}
+
 static int
 z3660_enter()
 {
@@ -375,7 +577,7 @@ z3660map()
 {
 	long	base, size;
 	ulong	t, bp;
-	int	i;
+	int	i, e;
 
 	if (regs)
 		return 0;
@@ -417,6 +619,16 @@ z3660map()
 		return ENXIO;
 	}
 	z3660_present = 1;
+	/*
+	 * F3-M0: with a live CPU data cache, assert that the whole board window
+	 * really is reached cache-inhibited before trusting a single further
+	 * mailbox answer.  A no-op (and executes no 040/060 instruction) while
+	 * z3660_cache is 0, which is every emulated deployment.
+	 */
+	if (e = z3660_ci_check( bp, bp + (ulong)Z3660_WINDOW_TOP)) {
+		regs = 0;
+		return e;
+	}
 	/*
 	 * ATTACH: fill the per-unit static-geometry cache in one sweep of all 8
 	 * piscsi units, so that no CDB ever pays for block size / block count /
