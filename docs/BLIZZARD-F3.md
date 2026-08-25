@@ -277,8 +277,14 @@ So the gate is a driver-owned global, defaulting to off, poked through `/dev/kme
 idiom this campaign already uses for `hg_on`, `i40_on` and `hat_cm_ram`:
 
 ```c
-long z3660_cache = 0;   /* 0 = off (shipping default); 40 = 68040 DC; 60 = 68060 DC */
+long z3660_cache;   /* 0 = off (shipping default); 40 = 68040 DC; 60 = 68060 DC */
 ```
+
+(As landed, `src/z3660.c` uses the tentative definition above, not `= 0`. Either spelling
+zero-initialises, but neither gets `.data` file storage — a tentative definition is COMMON
+and even an explicit `= 0` lands in `.bss` — so the knob is not file-pokeable from this
+repo. A build that wants a non-zero default at link time absorbs the COMMON with an
+out-of-tree `.data` definition; see the port repo's `src/z3660_cache_arm.s`.)
 
 Properties this buys, all of them load-bearing:
 
