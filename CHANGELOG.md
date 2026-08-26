@@ -1,3 +1,90 @@
+## 2026-08-24 — z3660: BLIZZARD F3 — CPU data-cache coherence for real 68040/68060 silicon (683559d 900f095 0ced4a1 d90f5fd f517811)
+
+This driver has never contained a cache instruction, and that was correct: every deployment so
+far has run on an EMULATED CPU (the Z3660 carries the guest 030/040 on core1's interpreter; the
+socketed 68LC060 has been a bus-parked passenger), and an interpreter has no data cache. F4 puts
+the same object on silicon that has one, where the same program is wrong in both directions — a
+WRITE hands the firmware a physical page whose newest bytes are still in the CPU's cache, and a
+READ lets the ARM overwrite a page whose stale dirty lines are later evicted over the fresh
+bytes. The round is pre-registered in `docs/BLIZZARD-F3.md` (683559d), written before any code
+and not rewritten to match the result.
+
+The central finding corrects a reading this file itself invited: **DTT0 is a LOGICAL-address
+TTR.** `pstart040.s:326` loads `0x003fc060` — the low 1 GB cache-inhibited for data — which
+covers THIS DRIVER'S accesses (`cp->addr` is a physical address by contract, dereferenced
+through the low identity alias) and the board window, and covers nothing about the same physical
+page's other aliases. User pages are copyback (`hat040.s` `hat_cm_ram = 0x20`, default since
+2026-07-30), and that is exactly where a raw-I/O buffer lives. Nor does anything else save us:
+/SNOOP sees 68k local-bus cycles only, and the piscsi path has the ARM writing Zynq DDR from its
+own memory system. Two load-bearing comment falsehoods went with it (900f095, comment-only, the
+cross-compiled object proven BYTE-IDENTICAL): the header's "Amix RAM is < 0x08000000 so the
+firmware always bounces" is false because `0x08000000` IS `AMIX_RAM_GUEST_BASE` — nothing in AMIX
+RAM is ever staged, so every "the bounce keeps us coherent" argument is void — and the mapping
+note's "this kernel has no PG_CI bit at all" is a 68030 fact restated as universal, when the
+040/060 leaf PTE carries a CM field the kernel already writes.
+
+**F3-M0 (0ced4a1) asserts the free ride instead of depending on it silently.** DTT0/DTT1/CACR are
+read at attach (raw `.word` `movec`, verified by disassembly against gcc 2.7.2.3 / GNU as 2.8.1)
+and both endpoints of the 0x90000-byte window are classified for supervisor data; TTR granularity
+is 16 MB, so a window that straddles at most one boundary is exhaustively covered by its two ends.
+A covering-but-cached TTR fails, and so does an address no enabled TTR covers — it would fall to
+page tables whose cache mode this driver cannot read and must not assume. The sptalloc mapping arm
+is a separate and worse failure: per-map device cache mode is still `hat040.s`'s deferred TODO, so
+that window would take `hat_cm_ram`, i.e. COPYBACK — not a slow mailbox, a broken one. It is
+declared UNSUPPORTED on real silicon and counted (`z3660_sptalloc_unsafe`), not silently taken.
+The default verdict is to measure loudly and carry on; `z3660_ci_enforce` turns it into ENXIO,
+because a first-silicon boot that refuses its own root device tells you nothing.
+
+**F3-M1 (d90f5fd) puts the maintenance at `z3660_rw()`'s chunk loop — not at
+`z3660_enter`/`z3660_leave`/`z3660_complete`**, which the plan had named. Those bracket the whole
+CDB including the synthesized commands, so a FROM_DEVICE invalidate hung there would fire on
+INQUIRY and REQUEST SENSE buffers the CPU itself just wrote. The chunk loop alone knows direction,
+physical address and length per chunk, and sits inside the existing spl6 bracket. `cpushl`+`cinvl`
+runs before every doorbell — before the WRITE-side staging `bcopy` as well, since that `bcopy`
+READS through the CI alias and would stage stale RAM otherwise — and `cinvl` runs after the
+completion of a READ **only on the direct-DMA arm**. It must NOT run after the bounce READ or
+after the five synthesized responses (REQUEST SENSE 18, INQUIRY 36, READ CAPACITY 8, MODE SENSE(6)
+12, MODE SENSE(10) 16 bytes, all sub-cache-line), where a 16-byte-rounded `cinvl` over a
+CPU-written range would DISCARD the bytes just written along with their line neighbours; those
+ranges get a single push-and-invalidate first instead. Every push is followed by an unconditional
+`cinvl` because the 68060 makes CPUSHL's invalidation conditional on CACR.DPI, and one sequence
+is then correct on both parts with no CPU-class branch. The line ops select by PHYSICAL line on a
+physically-tagged cache, so one op covers every virtual alias — including the copyback user
+mapping the buffer actually lives in — and this driver already holds the physical address and is
+forbidden to `vtop` it, so it needs no address conversion at all. The S4 doorbell/readback barrier
+is placed and gated now, before the store buffer that arms its hazard is turned on; that `nop`
+serializes pending writes on the 68060 is recorded as ASSUMED, owed a read of the MC68060UM. The
+S11 page-cross census COUNTS and deliberately does not refuse: the raw path's page-boundedness has
+never been instrumented, and this driver is the root device of two kernel lines, so the counter
+decides in either direction (0 across a boot and an install makes it a permanent refusal;
+non-zero means the chunk needs SPLITTING at the page boundary, not refusing).
+
+The whole round is gated on `z3660_cache` (default 0 = off, 40 = 68040 DC, 60 = 68060 DC), poked
+through `/dev/kmem` exactly like the port lane's `hg_on` / `i40_on` / `hat_cm_ram`. There is no
+compile-time discriminator available — this file is compiled once with `-m68020` into kernels for
+an emulated 030, an emulated 040 and a real 060 — and `cputype` may not be referenced, because the
+stock kernel has no such symbol and an extern would break the `nm -u` clean gate on the 030 line.
+As landed the definition is tentative, so the knob is COMMON in `.bss` and is NOT file-pokeable
+from this repo; a build wanting a non-zero default absorbs the COMMON out of tree (f517811
+corrects the design doc, which had shown `= 0`). Shipping-path proof, in increasing strength:
+`nm -u` unchanged but for `printf`; every `f468`/`f448`/`4e71`/`4e7a` site proven dominated by a
+`tstl z3660_cache` / `beq` in the cross-compiled disassembly; host harness **95 gating passed /
+0 failed** (was 77/0) and 6/6 oracle parity, the 18 new gates covering the gate-off path, each
+maintenance boundary, the READ-bounce no-invalidate rule, the S11 census and BOTH arms of the M0
+assertion. New kmem-readable symbols: `z3660_cache`, `z3660_ci_enforce`, `z3660_dtt0/dtt1/cacr`,
+`z3660_ci_ok`, `z3660_sptalloc_unsafe`, `z3660_push_n/inv_n`, `z3660_push_bytes/inv_bytes`,
+`z3660_bounce_wr_n/rd_n`, `z3660_pagecross_n`, `z3660_range_ovf`.
+
+**Nothing here is evidence about a real cache.** Everything above is proven against the toolchain,
+the object and the host harness; the metal A/B pre-registered in §7 — arm A (`z3660_cache = 0`)
+expected to FAIL, 15/15 clean cycles and 8/8 byte-identical canaries on arm B, with
+`z3660_push_n > 0` as a gate so a green run with a zero counter counts as failed — is still owed,
+and the bench structurally cannot run it (Amiberry models no 040/060 copyback data cache). One
+adjacent fact does now exist: on **2026-08-26** this driver served the AMIX root disk on a real
+**68LC060** for the first time, three boots for three to multiuser at cpufreq 80 with live piscsi
+I/O (`Amix/tmp/2026-08-26-blizzard-f4m2-att9-hwswap/`) — but on the free ride alone. `z3660_cache`
+was never poked and no F3 counter was read, so that run is a first, not a result.
+
 ## 2026-08-18 — z3660: page-size-agnostic board-window geometry (0bd3f10)
 
 The driver stated its window geometry as a page COUNT (BOUNCE_PAGES 32, span = BOUNCE_PAGES *
