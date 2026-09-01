@@ -149,11 +149,22 @@ The protocol is trivial to emulate — it's exactly the shape Amiberry/WinUAE al
 1. Unit-number mapping: Amix target (`cp->unit`, 0–7) → PISCSI drive index. Currently 1:1; confirm against
    how the Z3660 firmware enumerates the SD's RDB drives.
 2. Cache coherency on real metal in EMU/030 mode (the AmigaOS driver uses `CachePreDMA`/`CachePostDMA`
-   around the command write). Amix RAM is `< 0x08000000` so the firmware always bounces through MMIO
-   (board+0x80000), which should sidestep it — verify on HW.
-3. Always-bounce vs direct: confirmed Amix uses the bounce path (RAM < 0x08000000); fine.
+   around the command write). ~~Amix RAM is `< 0x08000000` so the firmware always bounces through MMIO
+   (board+0x80000), which should sidestep it~~ — verify on HW.
+3. ~~Always-bounce vs direct: confirmed Amix uses the bounce path (RAM < 0x08000000); fine.~~
 4. INQUIRY removable bit: set to 0 (fixed disk) for Amix vs the AmigaOS driver's 0x80 (removable) — confirm
    Amix `sd` is happy treating it as a fixed disk.
+
+🔴 **Mechanism correction (2026-08-24, BLIZZARD F3).** Items 2 and 3 are struck through because the
+premise both rest on is **false**, and it was load-bearing. `0x08000000` is **`AMIX_RAM_GUEST_BASE`**
+(`Z3660 src/amix_ram.h:41`) — the *base* of AMIX RAM, not a ceiling — so every AMIX physical address is
+at or **above** the threshold and **nothing in AMIX RAM is ever staged**: the firmware DMAs straight
+into 68k RAM on every shipping configuration. The driver's WRITE-side staging branch is therefore
+unreachable, which is exactly why `z3660_bounce_wr_n` exists — so "unreachable" is *measured* rather
+than believed (the host harness gates it at 0). Every "the bounce keeps us coherent" argument built on
+those two items is void, and this driver needs real CPU cache maintenance on real 040/060 silicon. The
+same correction landed in `src/z3660.c`'s comments in 900f095; full derivation in
+[`docs/BLIZZARD-F3.md`](docs/BLIZZARD-F3.md) §1.
 
 ## Sources
 - `repo/z3660-drivers/scsi/z3660_scsi.c`, `z3660_scsi.h`, `z3660_scsi_enums.h`, `bootrom.asm`.
@@ -500,6 +511,26 @@ mechanism. Nothing functional depended on the wrong story, and the cacheability
 conclusion is unchanged (section 0 carries CI clear, and the `sptalloc` path could
 never have been cache-inhibited either — this kernel has **no `PG_CI` bit at all**;
 `immu.h` defines only `PG_ADDR/PG_LOCK/PG_M/PG_REF/PG_W/PG_V`).
+
+🔴 **Cache correction (2026-08-24, BLIZZARD F3).** The clause immediately above — "the cacheability
+conclusion is unchanged … this kernel has **no `PG_CI` bit at all**" — is a **68030 fact restated as a
+universal one**, and on the 68040/68060 kernel line it is false: a leaf PTE there carries a two-bit
+`CM` field at bits 6-5 that the kernel already writes (`hat_cm_ram`, copyback for managed RAM). The two
+mapping arms are **not** alike on 040/060:
+
+* **direct arm** (below `VSECT1` — the shipped config): the window is reached through the low identity
+  alias, and the 040/060 port's `DTT0` cache-inhibits the whole low 1 GB *for data*. The mailbox and
+  the bounce aperture are cache-inhibited for free. The driver depends on that, so as of F3-M0 it
+  **asserts** it at attach (`z3660_ci_check`) instead of assuming it.
+* **`sptalloc` arm** (board at or above `VSECT1`, i.e. `autoconfig_rtg YES`): page-table-backed, and
+  per-map device `CM` selection is still a deferred TODO in the 040/060 port's `hat040.s` — so the
+  window would take `hat_cm_ram`, i.e. **COPYBACK**. A cacheable mailbox is not a slow driver, it is a
+  broken one. That arm is **UNSUPPORTED on real 040/060 silicon**, and is detected and counted
+  (`z3660_sptalloc_unsafe`) rather than silently taken.
+
+Corrected in `src/z3660.c` by 900f095; derivation in [`docs/BLIZZARD-F3.md`](docs/BLIZZARD-F3.md) §1.4
+and §3.3. Nothing about the *page count* or the `sptalloc`-removal argument above changes — this is a
+correction to the cacheability footnote only.
 
 **Why it matters.** `sptalloc()` draws from `sptmap`, a hardcoded 2048-page (4 MB)
 resource map that `page[]` — sized by presented RAM — is carved out of *first*, so
