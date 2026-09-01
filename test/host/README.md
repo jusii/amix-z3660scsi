@@ -12,9 +12,17 @@ make -C test/host clean
 
 ## What it exercises
 
-`z3660queue()` is driven with a hand-built `struct sdcom`; completion arrives
-through `cp->intr` (the harness's `timeout()` fires it synchronously). The
-driver is compiled **unmodified** apart from one inert seam: its `WRLONG`/
+Current run: **95 gating assertions passed, 0 failed**, plus 6/6 stretch parity
+against the firmware's CD oracle.
+
+`z3660queue()` is driven with a hand-built `struct sdcom` and completes
+**in-context**: since a5af58a the driver delivers through `z3660_complete()`
+before `z3660queue()` returns — there is no `timeout()` deferral any more, and a
+driver-owned FIFO flattens `dd.c`'s completion→re-issue recursion (`NOTES.md`
+2026-07-12). `kstubs.c` still defines a `timeout()`, but only as an inert stub of
+the historical kernel service; nothing calls it.
+
+The driver is compiled **unmodified** apart from one inert seam: its `WRLONG`/
 `RDLONG` MMIO macros are wrapped in `#ifndef HOST_TEST`, and the harness
 force-includes `mock_regs.h` (`-include`) to route every register access into
 the mock instead of a real volatile dereference. Without `-DHOST_TEST` the
@@ -33,6 +41,28 @@ Gating (mount-critical, gate the exit code):
 - Board mapping: `z3660map()` takes the **direct** (section-0 identity) arm and
   calls no `sptalloc()` — see below.
 - **Per-CDB round-trip budget** — see below.
+- Completion trampoline: a 50-deep re-issue chain through a *persistent* `sdcom`
+  (mimicking `dd.c`'s `&dp->com` + `ihandle`) — all 51 completions delivered,
+  nesting depth ≤ 2 (iterative, not one frame per I/O), FIFO never overran, no
+  mailbox re-entry.
+- `spl6` bracket: a simulated clock callout fired from inside an in-flight
+  mailbox command is deferred; with the bracket artificially removed
+  (`mock_spl_disabled`) the nested transaction is counted and the outer READ is
+  visibly corrupted.
+- **BLIZZARD F3 cache maintenance** (18 gates, see `../../docs/BLIZZARD-F3.md`):
+  that `z3660_cache = 0` — the shipping default — reaches no line op on any path;
+  that each maintenance boundary pushes exactly its chunk and only there
+  (per chunk, not per command); that the READ **bounce** arm must *not* invalidate,
+  because it would discard the `bcopy`; that the WRITE-side staging branch stays
+  unreachable (`z3660_bounce_wr_n == 0`); that the S11 page-cross census counts,
+  does **not** refuse, and still runs with the gate off; and both arms of the F3-M0
+  free-ride assertion — the shipped `DTT0` passes, a cacheable or an uncovered TTR
+  fails, and the `sptalloc` arm is refused under `z3660_ci_enforce`.
+
+Page-size neutrality is re-run by hand rather than gated: set `NBPP` in
+`stubs/sys/immu.h` and `F3_NBPP` in `z3660_test.c` to 4096 and the same 95
+assertions pass, so the derived window geometry *and* the datapath are
+page-size-agnostic (re-verified 2026-09-01).
 
 ## Round-trip budget: why register accesses are the unit of cost
 
@@ -80,11 +110,16 @@ semantics reproduced: `PDT`/`DRVTYPE` depend on the last drive select, and a
 `BLOCKSIZE0+4n` / `BLOCKS0+4n` read *reassigns* the current drive as a side
 effect.
 
-Pointer handling: on real hardware the driver hands the firmware a 32-bit
-physical address from `vtop()`. Under `HOST_TEST` `vtop()` is identity (the
-caller stores the buffer pointer straight into `cp->addr`) and the mock passes
-that host pointer through unmapped — register cells are `unsigned long` so a
-64-bit pointer survives the `*_ADDR3` slot (LP64 hosts only).
+Pointer handling: on real hardware the **caller** hands the driver a physical
+address — the stock disk path at `amiga/alien/dd.c:240`, and `amix-cdfs`'s
+`amix_kern_media.c`, both `vtop()` before filling `sc.addr`. The driver stores
+`cp->addr` straight into `*_ADDR3` and **never translates it**; adding a `vtop()`
+inside `z3660.c` would double-translate, and was evaluated and rejected as a
+non-fix (`NOTES.md` 2026-07-11 §(a) — do not resurrect it). Under `HOST_TEST`
+that same contract makes `vtop()` effectively the identity (the test stores the
+raw host buffer pointer in `cp->addr`) and the mock passes it through unmapped —
+register cells are `unsigned long` so a 64-bit pointer survives the `*_ADDR3`
+slot (LP64 hosts only).
 
 ## Board mapping: the harness exercises the arm the metal box runs
 
@@ -103,5 +138,6 @@ arms therefore land on the mock's buffers — which is exactly why
 `test_direct_mapping()` gates on the driver's `z3660_direct_map` flag: without
 it, a regression that silently reverted to `sptalloc()` would leave every other
 test passing. Moving `MOCK_BOARD_BASE` to `0x40000000` flips the flag and fails
-that one gate while the other 51 still pass, which is also how the retained
-high-base arm stays proven.
+three gates — the direct-map gate itself, plus the two F3-M0 assertions that key
+off it — while the other 92 pass, which is also how the retained high-base arm
+stays proven.

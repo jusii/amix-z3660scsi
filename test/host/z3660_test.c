@@ -3,10 +3,12 @@
  *
  * Compiles the REAL driver (src/z3660.c, -DHOST_TEST) against the mock piscsi
  * mailbox (mock_piscsi.c) and drives commands through z3660queue() with a
- * hand-built struct sdcom, completing via cp->intr (timeout() fires it
- * synchronously).  Asserts the driver's CD-ROM CDB bytes against the firmware's
- * established oracle (Z3660_emu/test/host/scsi_cd_test.cpp) and freezes the
- * disk path (pdt=0x00) -- the real box boots on that path.
+ * hand-built struct sdcom.  Completion is delivered IN-CONTEXT by the driver's
+ * own z3660_complete() before z3660queue() returns (a5af58a removed the timeout()
+ * deferral), so a test reads its result straight afterwards.  Asserts the
+ * driver's CD-ROM CDB bytes against the firmware's established oracle
+ * (Z3660_emu/test/host/scsi_cd_test.cpp) and freezes the disk path (pdt=0x00) --
+ * the real box boots on that path.
  *
  * Exit code is gated ONLY by the mount-critical assertions (g_fail).  The
  * stretch CD<->oracle parity table (incl. MODE SENSE) is reported, never gated.

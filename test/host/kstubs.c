@@ -69,9 +69,13 @@ int	n;
 }
 
 /*
- * timeout(func, arg, ticks): the driver defers completion to clock context via
- * timeout(z3660done, cp, 1).  Fire it synchronously so (*cp->intr)(cp) runs
- * before z3660queue() returns -- the test reads the result straight afterwards.
+ * timeout(func, arg, ticks): HISTORICAL -- nothing calls this any more.  The
+ * driver used to defer completion to clock context via timeout(z3660done, cp, 1);
+ * a5af58a removed that deferral, so completion is now delivered in-context by
+ * z3660_complete() and the cross-compiled object's undefined-symbol set no longer
+ * contains `timeout'.  The definition is kept as an inert stub of the kernel
+ * service, still firing synchronously, so the historical symbol resolves if some
+ * future test drives that path deliberately.
  */
 int timeout( func, arg, ticks)
 void	(*func)();
