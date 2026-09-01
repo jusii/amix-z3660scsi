@@ -22,7 +22,7 @@ several repos in the AMIX-on-Z3660 effort, each with a single job:
 
 The full map is in [`amix-kerntools/REPOS.md`](https://github.com/jusii/amix-kerntools/blob/master/REPOS.md).
 
-## Status (2026-06)
+## Status (2026-08)
 
 **Driver written, integrated, clean-gated, and proven on real hardware** ✅ —
 compiled with the native K&R `cc`, linked into the kernel (`checkunix`-clean),
@@ -33,10 +33,42 @@ blockers hit during bring-up turned out to be EMU-core MMU bugs in the **firmwar
 (demand-paging instruction restart), not in this driver — see
 [NOTES.md](NOTES.md) (2026-06-13 RESOLVED).
 
-Earlier milestone: clean cold-boot to multiuser on the Amix build box under
-Amiberry, which cannot emulate the Z3660 mailbox — so when the board is absent
-`autocon(0x144B0001)` returns 0 and `z3660queue` is simply never called (harmless,
-exactly like the A4091 driver with no A4091 present).
+Since that milestone — every item below has a dated entry in
+[CHANGELOG.md](CHANGELOG.md):
+
+- **CD-ROM units are answered.** A unit the firmware flags `pdt 0x05` gets a CD-ROM
+  INQUIRY, READ CAPACITY, MODE SENSE(6)/(10) and a DATA PROTECT rejection for writes
+  — which is what the Amix CD filesystem port (`amix-cdfs`) mounts.
+- **Completion is delivered synchronously, in-context.** No `timeout()` deferral: a
+  driver-owned FIFO flattens the completion→re-issue chain instead of recursing one
+  kernel-stack frame per I/O. This fixed a mount panic caused by touching a caller's
+  stack `sdcom` after its frame was gone.
+- **The board is mapped directly, and the `sptalloc()` is gone.** AMIX identity-maps
+  the low 1 GB, so a board below `VSECT1` — the shipped fixed base `0x10000000` — has
+  both its windows taken at their physical addresses: 33 pages given back to the
+  scarce 2048-page `sptmap`. The `sptalloc()` arm is retained, unchanged, for a board
+  at or above `VSECT1`.
+- **Per-unit static geometry is cached at attach.** A 2 KB READ costs **6** mailbox
+  round trips instead of 10, a WRITE 5 instead of 9. On this hardware a register
+  access is a **cross-core round trip**, not a bus cycle, so trips are the unit of cost.
+- **Window geometry is byte-primary and page-size-agnostic.** The fixed quantity is
+  the firmware's 64 KB aperture; page counts are derived, rounded up, and pinned from
+  both sides by compile-time guards.
+- **68040/68060 data-cache maintenance is implemented but gated OFF by default**
+  (`z3660_cache`, poked through `/dev/kmem`). Every deployment so far has run on an
+  emulated CPU, which has no data cache. The round is pre-registered in
+  [docs/BLIZZARD-F3.md](docs/BLIZZARD-F3.md) — and **nothing in it is yet evidence
+  about a real cache**: the metal A/B is still owed, and the bench emulator cannot run
+  it (it models no 040/060 copyback data cache).
+
+On **2026-08-26** this driver served the AMIX root disk on a real **68LC060** for the
+first time — three boots for three to multiuser with live piscsi I/O — but on the
+`DTT0` cache-inhibit free ride alone: `z3660_cache` was never poked and no F3 counter
+was read, so that is a first, not a result.
+
+Earlier milestone: clean cold-boot to multiuser on the Amix build box under Amiberry
+with **no Z3660 board present** — `autocon(0x144B0001)` returns 0 and `z3660queue` is
+simply never called (harmless, exactly like the A4091 driver with no A4091 present).
 
 ## Layout
 
@@ -47,9 +79,15 @@ src/kernel-patches/      dd.c.patch -- unified diff vs stock amiga/alien/dd.c
                          rows + Makefile OBJ are NOT here -- kerntools generates
                          them from driver.conf.
 driver.conf              0x144B0001 z3660queue "Z3660 SCSI" z3660.c
+test/host/               host CDB harness -- compiles the REAL driver on host gcc
+                         against a mock piscsi mailbox: `make -C test/host check`
+docs/                    design documents, written before the code they cover
+                         (BLIZZARD-F3.md -- the 040/060 data-cache round)
 assets/                  local reference material (gitignored): WinUAE 4.4.0 sources,
                          rollback firmware baselines, deploy scripts -- see assets/README.md
-NOTES.md                 protocol scouting + implementation status + test plan
+NOTES.md                 the dated engineering journal: protocol scouting, real-HW
+                         findings, and the corrections to both
+CHANGELOG.md             dated record of everything that landed -- the living state
 ```
 
 The upstream firmware source (formerly cloned into a gitignored `repo/`) is not kept in
