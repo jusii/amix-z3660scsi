@@ -2,12 +2,18 @@
 
 (Repo `amix-z3660scsi`; builds go through the sibling `amix-kerntools` harness +
 golden image — `(cd ../amix-kerntools && ./amix-build z3660scsi)`. Started as
-scouting notes; §"Implementation status" is the living state.)
+scouting notes and is now the **dated engineering journal** — read it
+newest-section-first, and note that a dated section corrects the ones above it rather than
+editing them. The **living state is [`CHANGELOG.md`](CHANGELOG.md)**: every landed change has a
+dated entry there. §"Implementation status" below is a frozen 2026-06-07 snapshot, superseded.)
 
 Goal: a native Amix (SVR4/68030) driver for the **Z3660** accelerator's onboard SCSI, so Amix on a real
 A4000+Z3660 stops relying on the buggy A3000-WD33C93 emulation. Mirrors the A4091 effort: develop in
 Amiberry, validate on real hardware. Source of truth: the open-source `z3660-drivers/scsi/` in
-[shanshe/Z3660](https://github.com/shanshe/Z3660) (cloned to `repo/`).
+[shanshe/Z3660](https://github.com/shanshe/Z3660) — read-only reference, **not kept in this repo**.
+Re-fetch it when needed (`repo/` is gitignored):
+`git clone --filter=blob:none https://github.com/shanshe/Z3660 repo`. The fork actually built and
+deployed is [`jusii/Z3660-amix`](https://github.com/jusii/Z3660-amix).
 
 ## Headline: route A is *easier* than the A4091
 
@@ -66,6 +72,8 @@ autoboot ROM came from the a4091.device tree), **not** the transport. ✅ (read 
    - `INQUIRY` / `READ_CAPACITY` / `TEST_UNIT_READY` / `MODE_SENSE` → either PISCSI raw-CDB passthrough
      (see `piscsi_scsi()` — **not yet read**) or synthesize from the `DRVTYPE`/`BLOCKS`/`BLOCKSIZE`/`CYLS`
      geometry registers. **Open question — decides INQUIRY handling.** 🟡
+     ✅ **Closed 2026-09-01: there is no passthrough** — the mailbox has no CDB register at all, so
+     synthesizing is the only option, and it is what shipped. See the 2026-09-01 section below.
 5. Completion is synchronous → the driver's `intr()`/done path is trivial (no SCRIPTS/ISTAT dance). This
    removes the single hardest A4091 problem (emulation-vs-real completion timing).
 
@@ -89,6 +97,7 @@ only for final validation — exactly the workflow that made the A4091 fast.
 
 1. `piscsi_scsi()` (the raw-CDB path) — does PISCSI accept arbitrary CDBs, or must we translate the few
    CDBs Amix issues? (Read `z3660_scsi.c` lines ~473+.)
+   ✅ **Answered 2026-09-01 — we must translate; there is no raw-CDB path.** See the 2026-09-01 section.
 2. Cache coherency in EMU(030) mode on real metal — is always-bounce sufficient, or do we need an Amix
    cache flush around the command write?
 3. Direct-vs-bounce: always-bounce (simplest, PIO) vs direct ARM access for fast RAM (faster). Start with
@@ -98,7 +107,7 @@ only for final validation — exactly the workflow that made the A4091 fast.
 5. Board base range on a real A4000+Z3660 (TT-gap vs TT1) — affects nothing functionally (sptalloc), but
    good to know.
 
-## Implementation status (2026-06-07)
+## Implementation status as of 2026-06-07 (superseded — see the dated sections below and CHANGELOG.md)
 
 **Driver written, integrated, clean-built, and boots.** ✅ (everything except the actual hardware mailbox,
 which Amiberry can't exercise — that waits on the emulator below or real HW.)
@@ -789,3 +798,107 @@ down to the frame boundary.
 `sys/immu.h` hardcodes `NBPP` 2048 alongside `PNUMSHFT` 11 and `POFFMASK` 0x7FF, and a real
 page-size change would have to move all three together. What changes here is that this
 driver would then follow correctly instead of silently over-claiming.
+
+## 2026-08-24: BLIZZARD F3 — CPU data-cache coherence for real 040/060 silicon
+
+**Authority for this round is [`docs/BLIZZARD-F3.md`](docs/BLIZZARD-F3.md)**, written *before* any
+code (683559d) and not rewritten to match the result. This section is the journal summary; the
+derivations, the suspect table and the pre-registered metal protocol are in that file.
+
+**Why now.** This driver has never contained a cache instruction and that was correct: every
+deployment so far ran on an **emulated** CPU (the Z3660 carries the guest 030/040 on core1's
+interpreter), and an interpreter has no data cache. Put the same object on a real 68040/68060 and the
+program is wrong in both directions — a WRITE hands the firmware a physical page whose newest bytes
+are still in the CPU's cache, and a READ lets the ARM overwrite a page whose stale dirty lines are
+evicted over the fresh bytes afterwards.
+
+**The finding: `DTT0` is a LOGICAL-address TTR.** It cache-inhibits *accesses through the low identity
+alias*, not the physical RAM behind them. So the free ride is real but narrow: it covers the board
+window and this driver's own dereferences of `cp->addr` (physical by contract, 2026-07-11 §(a)) — and
+covers nothing about the *same physical page's* other aliases. A raw-I/O buffer is a user page that
+userland has been touching through a **copyback** mapping, and neither `DTT0` nor `/SNOOP` nor the
+ARM's own cache maintenance touches those lines. See §1.
+
+**F3-M0 (0ced4a1) asserts the free ride instead of depending on it silently.** `DTT0`/`DTT1`/`CACR`
+are read at attach (raw `.word movec`, checked against the disassembly) and **both endpoints** of the
+0x90000-byte board window are classified for supervisor data — TTR granularity is 16 MB, so a window
+straddling at most one boundary is exhaustively covered by its two ends. A covering-but-*cacheable*
+TTR fails, and so does an address no enabled TTR covers (it would fall to page tables whose cache mode
+this driver cannot read and must not assume). The `sptalloc` arm is worse than a failed check and is
+declared **UNSUPPORTED** on silicon (see the 2026-08-14 cache correction above). Default verdict is to
+measure loudly and carry on; `z3660_ci_enforce` turns it into `ENXIO` instead.
+
+**F3-M1 (d90f5fd) puts the maintenance in `z3660_rw()`'s chunk loop** — *not* at
+`z3660_enter`/`z3660_leave`/`z3660_complete`, which the plan had named. Those bracket the whole CDB
+including the synthesized commands, so a FROM_DEVICE invalidate hung there would fire on INQUIRY and
+REQUEST SENSE buffers the CPU itself just wrote. The chunk loop alone knows direction, physical
+address and length per chunk, and already sits inside the `spl6` bracket. `cpushl`+`cinvl` runs before
+every doorbell; `cinvl` runs after a READ completes **only on the direct-DMA arm** — never after a
+bounce READ and never after the five synthesized responses, where a 16-byte-rounded invalidate would
+discard the bytes just written along with their line neighbours. Every push is followed by an
+unconditional `cinvl` because the 68060 makes `CPUSHL`'s invalidation conditional on `CACR.DPI`, so
+one sequence is correct on both parts with no CPU-class branch. The line ops select by **physical**
+line on a physically-tagged cache, so a single op covers every virtual alias — and this driver already
+holds the physical address and is forbidden to `vtop()` it, so it needs no address conversion at all.
+
+**The gate.** Everything above is behind `z3660_cache`: **0 = off, and 0 is the default**; 40 = 68040
+DC, 60 = 68060 DC. It is poked through `/dev/kmem` like the 040/060 port lane's own knobs. There is no
+compile-time discriminator — this file is compiled once, with `-m68020`, into kernels for an emulated
+030, an emulated 040 and a real 060 — and `cputype` may not be referenced because the stock kernel has
+no such symbol and an `extern` would break the `nm -u` clean gate on the 030 line. As landed the
+definition is *tentative*, so the knob is COMMON in `.bss` and is **not** file-pokeable from this repo
+(f517811 corrects the design doc, which had shown `= 0`).
+
+**New kmem-readable symbols:** `z3660_cache`, `z3660_ci_enforce`, `z3660_dtt0`/`z3660_dtt1`/
+`z3660_cacr`, `z3660_ci_ok`, `z3660_sptalloc_unsafe`, `z3660_push_n`/`z3660_inv_n`,
+`z3660_push_bytes`/`z3660_inv_bytes`, `z3660_bounce_wr_n`/`z3660_bounce_rd_n`, `z3660_pagecross_n`,
+`z3660_range_ovf`. The S11 page-cross census **counts and deliberately does not refuse**: the raw
+path's page-boundedness has never been instrumented and this driver is the root device of two kernel
+lines, so the counter decides in either direction (0 across a boot and an install makes it a permanent
+refusal; non-zero means the chunk needs *splitting* at the page boundary, not refusing).
+
+**Evidence, and its ceiling.** `nm -u` unchanged but for `printf`; every `f468`/`f448`/`4e71`/`4e7a`
+site proven dominated by a `tstl z3660_cache` / `beq` in the cross-compiled disassembly; host harness
+**95 gating passed / 0 failed** (was 77/0) and 6/6 oracle parity, the 18 new gates covering the
+gate-off path, each maintenance boundary, the READ-bounce no-invalidate rule, the S11 census and both
+arms of the M0 assertion. **None of that is evidence about a real cache.** The metal A/B
+pre-registered in `docs/BLIZZARD-F3.md` §7 — arm A (`z3660_cache = 0`) expected to FAIL, 15/15 clean
+cycles and 8/8 byte-identical canaries on arm B, with `z3660_push_n > 0` as a gate so a green run with
+a zero counter counts as failed — is still **owed**, and the bench structurally cannot run it: the
+emulator models no 040/060 copyback data cache.
+
+## 2026-08-26: first boot of AMIX off this driver on real 68LC060 silicon
+
+On 2026-08-26 this driver served the AMIX root disk on a **real 68LC060** for the first time — three
+boots for three to multiuser at cpufreq 80, with live piscsi I/O throughout. Every earlier deployment
+ran the guest CPU on the firmware's interpreter.
+
+**It is a first, not a result.** The run rode the `DTT0` cache-inhibit free ride alone: `z3660_cache`
+was never poked, so no F3 maintenance executed, and no F3 counter was read afterwards. It says the
+driver survives on silicon in the configuration where the free ride holds; it says nothing about the
+F3 round, which still owes its A/B. (Campaign evidence lives in the workspace's dated scratch
+directory, not published.)
+
+## 2026-09-01: `piscsi_scsi()` read — the mailbox has no raw-CDB path
+
+Closing the last open question from the 2026-06-07 design pass ("does PISCSI accept arbitrary CDBs?").
+Read in the firmware repo at `z3660-drivers/scsi/z3660_scsi.c`, `piscsi_scsi()` (~:473, dispatched
+from the device's `HD_SCSICMD` case ~:873):
+
+- **`piscsi_scsi()` is not a firmware service.** It is **guest-side 68k code** — part of the AmigaOS
+  `z3660_scsi.device` that ships in the firmware repo — reached through an AmigaOS `IORequest`, not
+  through the mailbox. There is no way for this driver to call it.
+- **The mailbox has no CDB register.** `z3660_scsi_enums.h` is a block-level command set: drive
+  select, geometry, `READ`/`WRITE`(`64`)/`READBYTES`/`WRITEBYTES`, the two address triples,
+  `USED_DMA`, plus partition/FS helpers. Nothing carries an opaque CDB.
+- **So every driver on this protocol must synthesize**, and the AmigaOS one does exactly that:
+  `piscsi_scsi()` answers TEST UNIT READY, INQUIRY, READ CAPACITY(10) and MODE SENSE(6) in 68k
+  software from `get_blocksize()`/`get_blocks()`, and turns READ/WRITE 6/10 into the same
+  `*_ADDR1/2/3` + doorbell sequence `z3660_rw()` uses.
+
+**Verdict: the synthesize path was the only option, and it is what shipped** — proven on metal since
+2026-06-13 and byte-checked against the firmware's own CD oracle in `test/host/`. One deliberate
+divergence stands (2026-06-07 open question 4, still correct): the AmigaOS driver sets INQUIRY byte 1
+to `0x80` (removable) for every unit, while this driver reports a fixed disk for `pdt 0x00` and only
+sets `0x80` for a CD-ROM (`pdt 0x05`) — which is what the CD oracle expects and what Amix `sd` is
+happy with.
