@@ -1,3 +1,11 @@
+# Changelog
+
+## 2026-09-01 — docs: NOTES retracts the two cache claims BLIZZARD F3 falsified; journal to HEAD; README status 2026-08; test/host described as it is (daf6c6b, 9a9f280, a374476, cacc989)
+
+Doc/comment-only. NOTES.md retracts the two 030 cache claims the BLIZZARD F3 metal round falsified and
+brings the journal up to HEAD with its reader pointers fixed; README states the 2026-08 status and a layout
+block that lists what exists; test/host describes the harness the driver actually has (post-a5af58a).
+
 ## 2026-08-24 — z3660: BLIZZARD F3 — CPU data-cache coherence for real 68040/68060 silicon (683559d 900f095 0ced4a1 d90f5fd f517811)
 
 This driver has never contained a cache instruction, and that was correct: every deployment so
@@ -144,7 +152,6 @@ allocation. sptmap draw at the metal base: 33 pages → 0 (with z3660net's fix: 
 returned to the 2048-page pool). Falsification-tested (52/52 gating; moving the mock base
 flips z3660_direct_map and fails exactly one gate). Reaches the box at the next kernel
 relink/golden regeneration.
-# Changelog
 
 ## 2026-07-12
 
