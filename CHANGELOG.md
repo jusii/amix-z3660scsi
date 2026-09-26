@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-26 — docs tidy: STATUS header current, testing path built, boot-fsck open (9fa05a5, 240d863)
+
+z3660.c STATUS header reflects the 2026-06-13 metal boot (comment only; object byte-identical on
+three builds). NOTES: the Amiberry Z3660 SCSI emulation exists; the bench rig's stale +cdfs kernel gap
+is recorded; boot-fsck marked open as of 2026-09-26. BLIZZARD-F3 cites no tmp/ path.
+
 ## 2026-09-01 — docs: NOTES retracts the two cache claims BLIZZARD F3 falsified; journal to HEAD; README status 2026-08; test/host described as it is (daf6c6b, 9a9f280, a374476, cacc989)
 
 Doc/comment-only. NOTES.md retracts the two 030 cache claims the BLIZZARD F3 metal round falsified and
@@ -90,7 +96,7 @@ expected to FAIL, 15/15 clean cycles and 8/8 byte-identical canaries on arm B, w
 and the bench structurally cannot run it (Amiberry models no 040/060 copyback data cache). One
 adjacent fact does now exist: on **2026-08-26** this driver served the AMIX root disk on a real
 **68LC060** for the first time, three boots for three to multiuser at cpufreq 80 with live piscsi
-I/O (`Amix/tmp/2026-08-26-blizzard-f4m2-att9-hwswap/`) — but on the free ride alone. `z3660_cache`
+I/O (campaign evidence is in the workspace's dated scratch directory, not published; see NOTES.md §2026-08-26) — but on the free ride alone. `z3660_cache`
 was never poked and no F3 counter was read, so that run is a first, not a result.
 
 ## 2026-08-18 — z3660: page-size-agnostic board-window geometry (0bd3f10)
