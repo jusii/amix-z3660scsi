@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-26 — stock-firmware hardening: units with a bad block size are skipped (70f54b6)
+
+z3660_geom_fill() reads BLOCKSIZE first and skips a unit whose block size is not a power of two in
+512..4096 or whose block count is 0, never reading BLOCKS for it — stock firmware (without the fork's
+c0510a7) divides by zero there. Skipped units answer "absent", get no doorbell, are named once.
+Harness 131/131 (was 95), parity 6/6; object 8004 B, same undefined-symbol set. Kernel relink needed.
+
 ## 2026-09-26 — docs tidy: STATUS header current, testing path built, boot-fsck open (9fa05a5, 240d863)
 
 z3660.c STATUS header reflects the 2026-06-13 metal boot (comment only; object byte-identical on
