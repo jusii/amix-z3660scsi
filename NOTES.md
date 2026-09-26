@@ -139,20 +139,18 @@ Verified on the Amix build box (`../amix-a4091/hdf/Amix-dbg.hdf`):
 command trigger, the bounce copy, geometry/READ/WRITE against a real backing store). That needs either the
 Amiberry emulation below or the real A4000+Z3660.
 
-## Testing path: an Amiberry `piscsi` emulation (the A4091-style fast loop)
+## Testing path: the Amiberry Z3660 native SCSI emulation (the A4091-style fast loop)
 
-The protocol is trivial to emulate — it's exactly the shape Amiberry/WinUAE already implement for the
-**a2065** (an AutoConfig board with MMIO registers, which this host even uses for networking). Plan:
-- Register an AutoConfig board, **manufacturer 0x144B / product 0x01**, sized to cover the 0x2000 register
-  window and the 0x80000 bounce window (model on `a2065_config()` + `autoconfig_bytes`).
-- An `addr_bank` whose `lput`/`lget` implement the mailbox: latch `DRVNUMX`/`*_ADDR1..3`; on a write to
-  `READ`/`WRITE`/`READBYTES`/`WRITEBYTES` (offset 0x00/0x04/0x88/0x8C) do the backing-store I/O **inside the
-  bus cycle** (so the write is synchronous, matching real HW) into the buffer addr or the 0x80000 bounce
-  window; answer `DRVTYPE`/`BLOCKS`/`BLOCKSIZE`/`CYLS/HEADS/SECS`/`USED_DMA` from the hardfile geometry.
-- Back it with a plain RDB/UFS hardfile. ~a few hundred lines, ≈ `a2065.cpp`'s device logic.
-- **Blocker:** needs an **Amiberry source build** (only the 8.1.6 binary + a WinUAE source tree are on this
-  machine). Cloning `BlitterStudio/amiberry` @ 8.1.6, adding the device, and building (SDL2 deps) is the
-  next sizable chunk. Alternatively, validate straight on the real A4000+Z3660 when access is available.
+**Status as of 2026-09-26: built, not a plan.** The emulation this section once proposed exists in
+the workspace's amiberry fork as its Z3660 native SCSI device (`amiberry/src/z3660_scsi.cpp`,
+documented in `amiberry/docs/z3660-scsi.md`): a Zorro III AutoConfig 0x144B/0x01 board, a register
+file plus a block read/write engine over raw hardfile or ISO backing. The mailbox itself has been
+validated on real A4000+Z3660 since the 2026-06-13 metal boot.
+
+**Known bench gap (2026-09-26):** the piscsi bench rig currently panics at `mountroot`, because its
+`boot.hdf` carries a pre-fix `+cdfs` kernel. It is a stale-image problem, not a driver or emulation
+bug: the rebuild recipe is recorded in the workspace notes and the rebuild is pending an
+amix-kerntools dispatch. Until then, bench results from that rig are not evidence about this driver.
 
 ## Open questions (for HW/emulation validation)
 1. Unit-number mapping: Amix target (`cp->unit`, 0–7) → PISCSI drive index. Currently 1:1; confirm against
@@ -350,6 +348,11 @@ repeat until CLEAN → `reboot -n`. (SVR4.0 can't `mount -o remount,ro /` — "I
 `/etc/bcheckrc` on boot: mount root RO → `fsck -y` (auto-yes, no prompt) → if MODIFIED, `reboot -n`
 → only mount RW + clear FSACTIVE after a clean pass. Fix the FSACTIVE-stamp ordering + no-sync reboot
 so it repairs once and proceeds — no loop, no manual fsck.
+
+**Status: open as of 2026-09-26, no run on record.** A read-only search of this repo, amix-kerntools,
+amix-installng and grimoire-amix found no dated closure. The nearest artifact is
+`amix-kerntools/system-fixes/bcheckrc.fixed` (bdd9cf2, 2026-06-22), which its own header marks
+PROPOSED, cosmetic only, and needing HW validation; no validated run of it is recorded.
 
 ## 2026-07-11: two load-bearing contracts (T2.P3) — the spl6 bracket + the addr-is-physical rule
 

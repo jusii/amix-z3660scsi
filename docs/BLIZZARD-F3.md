@@ -151,7 +151,8 @@ BLIZZARD §7 F4-M5 (*"Sequence the knob that arms it after F3-M3, never before"*
 
 ## 3. SUSPECT DISPOSITION
 
-Every S-item from `Amix/tmp/2026-08-24-lc060-recon/RECON.md`, re-verified in-tree today against
+Every S-item from the 2026-08-24 LC060 recon (S2, S3, S4, S5/S6, S8, S10, S11 — an untracked
+workspace scratch note, not in this repo; every item is reproduced below), re-verified in-tree today against
 `src/z3660.c` as it stands at `ab04824`.
 
 | # | claim | re-verified? | disposition |
