@@ -55,11 +55,11 @@
  * it and call (*cp->intr)(cp).  Add to sd.c scsicard[]:
  *     0x144B0001, &z3660queue, "Z3660 SCSI"
  *
- * STATUS: written from the open-source protocol; compiles + integrates + boots in
- * the Amix build box.  HARDWARE interaction (the actual ARM mailbox) is validated
- * only on a real A4000+Z3660 or against an Amiberry piscsi emulation -- Amiberry
- * does not emulate the Z3660, so when absent autocon() returns 0 and this driver
- * fails the I/O gracefully (harmless), just like the A4091 driver when no A4091.
+ * STATUS: carries the AMIX root disk on real A4000+Z3660 (multiuser since the
+ * 2026-06-13 metal boot; on 68LC060 silicon since 2026-08-26) and on the amiberry
+ * fork's Z3660 native SCSI emulation.  The 040/060 cache-maintenance A/B (see
+ * docs/BLIZZARD-F3.md) is still owed.  With no board, autocon() returns 0 and the
+ * I/O fails gracefully, just like the A4091 driver when no A4091 is present.
  *
  * Refs: repo/z3660-drivers/scsi/{z3660_scsi.c,z3660_scsi_enums.h},
  *       repo/KNOWN_ISSUES.md, ../amix-a4091/src/a4091-wr.c (Amix framework).
