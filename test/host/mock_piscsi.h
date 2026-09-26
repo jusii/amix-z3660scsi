@@ -72,4 +72,15 @@ extern unsigned long mock_trips_blocks;     /* reads of BLOCKS0+4n    (0x220+)  
 extern unsigned long mock_trips_pdt;        /* reads of PDT       (0xA0)         */
 void mock_trips_reset(void);
 
+/*
+ * Stock-firmware hazard accounting (see mock_piscsi.c).  mock_div0 counts reads
+ * of BLOCKS0+4n for a unit whose block_size is 0 -- the read on which stock
+ * firmware divides by zero; mock_doorbells[u] counts READ/WRITE triggers for
+ * unit u.  Both are zeroed only by mock_reset().
+ */
+extern unsigned long mock_div0;
+extern unsigned long mock_doorbells[8];
+void mock_set_geom(int unit, unsigned long pdt,
+                   unsigned long block_size, unsigned long nblocks);
+
 #endif

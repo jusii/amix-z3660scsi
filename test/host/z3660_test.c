@@ -33,6 +33,10 @@ extern unsigned long z3660_nest_depth, z3660_nest_hits;
 extern unsigned char z3660_direct_map;
 
 extern int	z3660present();		/* sd.c probe hook (K&R decl) */
+
+/* stock-firmware hardening: which units the geometry fill skipped, and how
+ * many console lines that produced (each unit is named once per boot) */
+extern unsigned long	z3660_skipmask, z3660_skip_msgs;
 static char	*g_probe_base;		/* board base z3660present() reports */
 
 /* CD units on this mock bus: 6 = CD-ROM (also the detection-probe unit), 0 = disk. */
@@ -144,22 +148,30 @@ static void test_direct_mapping()
 	 * The per-unit static-geometry cache must be filled HERE, at attach --
 	 * one sweep of all 8 piscsi units -- so that no later CDB pays for it.
 	 * Gating the probe's trip breakdown pins that down: eight BLOCKSIZE0+4n
-	 * reads, eight BLOCKS0+4n reads and eight PDT reads (each preceded by its
-	 * own DRVNUMX select, plus the one DRVNUMX the DRVTYPE presence probe
-	 * itself writes).  If the fill were ever moved back into the command path
-	 * these counts would drop to zero and the hot-path gate below would rise.
+	 * reads (one per unit), then -- ONLY for the two units whose block size
+	 * is valid (disk 0, CD 6) -- a BLOCKS0+4n read and a DRVNUMX-selected PDT
+	 * read, plus the one DRVNUMX the DRVTYPE presence probe itself writes.
+	 * The six unmapped units report block size 0 and must be skipped before
+	 * BLOCKS0+4n is read: on STOCK firmware that read divides by zero
+	 * (stock-firmware hardening, 2026-09-26).  If the fill were ever moved
+	 * back into the command path these counts would drop to zero and the
+	 * hot-path gate below would rise.
 	 */
-	printf("       probe trips=%lu (rd=%lu wr=%lu) drvnumx=%lu blocksize=%lu blocks=%lu pdt=%lu\n",
+	printf("       probe trips=%lu (rd=%lu wr=%lu) drvnumx=%lu blocksize=%lu blocks=%lu pdt=%lu div0=%lu\n",
 	       mock_trips, mock_trips_rd, mock_trips_wr, mock_trips_drvnumx,
-	       mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt);
+	       mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt, mock_div0);
 	CHECK( mock_trips_blocksize == 8,
-	       "attach fills BLOCKSIZE for all 8 units (geometry cached at probe)");
-	CHECK( mock_trips_blocks == 8,
-	       "attach fills BLOCKS for all 8 units (geometry cached at probe)");
-	CHECK( mock_trips_pdt == 8,
-	       "attach fills PDT for all 8 units (geometry cached at probe)");
-	CHECK( mock_trips_drvnumx == 9,
-	       "attach selects each unit before its PDT read (8) + the DRVTYPE probe (1)");
+	       "attach reads BLOCKSIZE for all 8 units (geometry cached at probe)");
+	CHECK( mock_trips_blocks == 2,
+	       "attach reads BLOCKS only for the 2 units with a valid block size");
+	CHECK( mock_trips_pdt == 2,
+	       "attach reads PDT only for the 2 present units");
+	CHECK( mock_trips_drvnumx == 3,
+	       "attach selects each present unit before its PDT read (2) + the DRVTYPE probe (1)");
+	CHECK( mock_div0 == 0,
+	       "attach never reads BLOCKS of a block-size-0 unit (stock fw would divide by 0)");
+	CHECK( z3660_skipmask == 0xBE && z3660_skip_msgs == 6,
+	       "attach names each of the 6 unmapped units once (skipmask 0xBE)");
 }
 
 /* ====================================================================== */
@@ -302,8 +314,10 @@ static void test_unmapped_unit_not_cached()
 	       g_status, (int)g_okay);
 	CHECK( !g_okay && g_status == 0xff,
 	       "unmapped unit: READ(10) REFUSED (firmware would silently no-op it)");
-	CHECK( mock_trips_blocks == 1,
+	CHECK( mock_trips_blocksize == 1,
 	       "unmapped unit: geometry was actually probed (cache miss, not a stale hit)");
+	CHECK( mock_trips_blocks == 0 && mock_trips_pdt == 0,
+	       "unmapped unit: block size 0 stops the probe before BLOCKS/PDT (no stock div0)");
 
 	/* Second identical command: the miss must repeat, i.e. nothing was latched. */
 	memset( buf, 0xEE, sizeof buf);
@@ -314,7 +328,7 @@ static void test_unmapped_unit_not_cached()
 	       g_status, (int)g_okay);
 	CHECK( !g_okay && g_status == 0xff,
 	       "unmapped unit: second READ(10) still refused");
-	CHECK( mock_trips_blocks == 1 && mock_trips_blocksize == 1 && mock_trips_pdt == 1,
+	CHECK( mock_trips_blocksize == 1 && mock_trips_blocks == 0 && mock_trips_pdt == 0,
 	       "unmapped unit: RE-PROBED on every command (absence never cached)");
 	CHECK( mock_trips == first_trips,
 	       "unmapped unit: identical trip cost both passes (no latched state)");
@@ -331,6 +345,91 @@ static void test_unmapped_unit_not_cached()
 	       "unmapped unit: mapped unit's cached geometry still intact afterwards");
 	CHECK( mock_trips == 1,
 	       "unmapped unit: mapped unit still answers from cache (1 trip)");
+}
+
+/*
+ * GATING: stock-firmware hardening (2026-09-26).
+ *
+ * Stock Z3660 firmware lacks the fork's c0510a7 guard: its BLOCKS0+4n read is
+ * devs[n].fs / devs[n].block_size unguarded, and block_size is 0 for any unit
+ * with no drive mapped (BSS; piscsi_shutdown() re-zeroes it and leaves fs
+ * stale).  The helper's quotient is then 0 (fs 0) or all-ones (stale fs).  The
+ * driver must key absence on BLOCKSIZE0+4n -- a plain load in every firmware
+ * -- and, for any block size that is not a power of two in 512..4096 or any
+ * zero block count, skip the unit: never read BLOCKS for a zero block size,
+ * never cache it, never ring a doorbell for it, answer exactly like the fork
+ * firmware's 0-block unit, and name it on the console once only.
+ */
+struct bad_geom { int unit; unsigned long bs, nb; const char *what; };
+
+static void test_stock_fw_bad_geometry()
+{
+	static const struct bad_geom cases[] = {
+		{ 1, 0UL,    0xFFFFFFFFUL, "bs 0, stale-fs all-ones quotient (stock)" },
+		{ 2, 1000UL, 100UL,        "bs 1000 (not a power of two)" },
+		{ 4, 8192UL, 100UL,        "bs 8192 (above 4096)" },
+		{ 5, 512UL,  0UL,          "bs 512, 0 blocks" },
+		{ 7, 256UL,  100UL,        "bs 256 (below 512)" },
+	};
+	uchar		cdb[10], buf[512];
+	unsigned long	msgs0, div0_0, bells0;
+	int		i, k;
+
+	printf("\n=== GATE: stock-firmware hardening -- bad unit geometry is skipped ===\n");
+	msgs0 = z3660_skip_msgs;
+	for (k = 0; k < (int)(sizeof cases / sizeof cases[0]); k++) {
+		const struct bad_geom *c = &cases[k];
+		char	msg[160];
+
+		mock_set_geom( c->unit, 0x00, c->bs, c->nb);
+		div0_0 = mock_div0;
+		bells0 = mock_doorbells[c->unit];
+
+		/* READ(10) 1 block @ LBA 0, then WRITE(10) 1 block: both refused */
+		memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[8] = 1;
+		memset( buf, 0xEE, sizeof buf);
+		mock_trips_reset();
+		run_cmd( c->unit, cdb, 10, buf, 512);
+		printf("       unit %d %-42s READ: status=0x%02X okay=%d trips=%lu bs=%lu blocks=%lu pdt=%lu\n",
+		       c->unit, c->what, g_status, (int)g_okay, mock_trips,
+		       mock_trips_blocksize, mock_trips_blocks, mock_trips_pdt);
+		snprintf( msg, sizeof msg, "stock hardening: unit %d (%s) READ(10) refused", c->unit, c->what);
+		CHECK( !g_okay && g_status == 0xff, msg);
+		for (i = 0; i < 512 && buf[i] == 0xEE; i++) ;
+		snprintf( msg, sizeof msg, "stock hardening: unit %d (%s) buffer untouched", c->unit, c->what);
+		CHECK( i == 512, msg);
+
+		memset( cdb, 0, sizeof cdb); cdb[0] = 0x2A; cdb[8] = 1;
+		run_cmd( c->unit, cdb, 10, buf, 512);
+		snprintf( msg, sizeof msg, "stock hardening: unit %d (%s) WRITE(10) refused", c->unit, c->what);
+		CHECK( !g_okay && g_status == 0xff, msg);
+
+		snprintf( msg, sizeof msg, "stock hardening: unit %d (%s) no doorbell ever rung", c->unit, c->what);
+		CHECK( mock_doorbells[c->unit] == bells0, msg);
+		snprintf( msg, sizeof msg, "stock hardening: unit %d (%s) no BLOCKS read at bs 0", c->unit, c->what);
+		CHECK( mock_div0 == div0_0, msg);
+
+		/* READ CAPACITY: the fork firmware's 0-block answer, not a garbage one */
+		memset( cdb, 0, sizeof cdb); cdb[0] = 0x25;
+		memset( buf, 0x11, sizeof buf);
+		run_cmd( c->unit, cdb, 10, buf, 8);
+		snprintf( msg, sizeof msg, "stock hardening: unit %d (%s) READ CAPACITY = absent answer (lba -1, bs 512)", c->unit, c->what);
+		CHECK( be32( buf) == 0xFFFFFFFFUL && be32( buf + 4) == 512UL, msg);
+	}
+	printf("       skip messages: %lu before, %lu after; skipmask=0x%02lX div0=%lu\n",
+	       msgs0, z3660_skip_msgs, z3660_skipmask, mock_div0);
+	CHECK( z3660_skip_msgs == msgs0,
+	       "stock hardening: re-probing a skipped unit prints nothing new (named once)");
+
+	/* A good unit is not collateral damage. */
+	memset( cdb, 0, sizeof cdb); cdb[0] = 0x28; cdb[8] = 1;
+	run_cmd( U_DISK, cdb, 10, buf, 512);
+	CHECK( g_okay && g_status == 0 && memcmp( buf, mock_backing( U_DISK), 512) == 0,
+	       "stock hardening: mapped disk unit still reads correctly");
+
+	/* restore: those units were unmapped (bs 0, 0 blocks) for later tests */
+	for (k = 0; k < (int)(sizeof cases / sizeof cases[0]); k++)
+		mock_set_geom( cases[k].unit, 0x00, 0UL, 0UL);
 }
 
 /* ====================================================================== */
@@ -974,6 +1073,7 @@ int main()
 
 	test_hotpath_trip_budget();
 	test_unmapped_unit_not_cached();
+	test_stock_fw_bad_geometry();
 
 	test_reentry();
 	test_completion_trampoline();
@@ -981,6 +1081,11 @@ int main()
 	test_f3_cache();
 
 	stretch_cd_parity();
+
+	/* whole-run invariant: the driver never asked for a zero-divisor BLOCKS */
+	CHECK( mock_div0 == 0,
+	       "whole run: no BLOCKS read of a block-size-0 unit (stock fw div0 never hit)");
+	printf("       whole-run div0=%lu\n", mock_div0);
 
 	printf("\n=== GATING: %d passed, %d failed ===\n", g_pass, g_fail);
 	printf("=== STRETCH parity: %d match, %d deviation ===\n", s_match, s_dev);

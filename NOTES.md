@@ -905,3 +905,62 @@ divergence stands (2026-06-07 open question 4, still correct): the AmigaOS drive
 to `0x80` (removable) for every unit, while this driver reports a fixed disk for `pdt 0x00` and only
 sets `0x80` for a CD-ROM (`pdt 0x05`) — which is what the CD oracle expects and what Amix `sd` is
 happy with.
+
+## 2026-09-26: stock-firmware hardening — an unmapped unit is judged by its block size
+
+Owner priority (P-2): Amix must run on **stock** Z3660 firmware. The fork's `c0510a7`
+("never divide by an unmapped unit's zero block size", `piscsi_unit_blocks()`) is **not** in
+stock (`git merge-base --is-ancestor c0510a7 upstream/main` → no).
+
+**What stock returns for an unmapped unit** (`upstream/main:.../src/scsi/scsi.c`,
+`handle_piscsi_read()`, read-only):
+
+- `PISCSI_CMD_BLOCKSIZE0..7` (`P_BLOCKSIZE0+4n`): sets `piscsi_cur_drive = n` and returns
+  `devs[n].block_size` — a plain load, no arithmetic. It is **0** for any unit with no drive:
+  `devs[]` is BSS, `piscsi_init()` never assigns `block_size` (only `piscsi_map_drive()` does),
+  and `piscsi_shutdown()` re-zeroes it for every open unit.
+- `PISCSI_CMD_BLOCKS0..7` (`P_BLOCKS0+4n`): returns `devs[n].fs / devs[n].block_size`
+  **unguarded** — `fs` is `uint64_t` (`scsi.h`), so a 64-bit divide by zero in the EABI helper
+  (no hardware divide on the Cortex-A9, no `__aeabi_ldiv0` override in the tree). Per libgcc's
+  `__aeabi_uldivmod` the quotient is **0** when `fs == 0` (a never-mapped unit on a cold boot)
+  and **all-ones** (`0xFFFFFFFF` on the wire) when `fs != 0` — i.e. a unit that was mapped and
+  then shut down, because `piscsi_shutdown()` zeroes `block_size` but leaves `fs` stale.
+  (Source-derived; the helper's result is not measured on metal.)
+- `piscsi_unmap_drive()` clears only `fd`, leaving both `block_size` and `fs` stale; nothing on
+  the mailbox except `P_DRVTYPE` (`fd != 0`) sees that. Not guarded here — see the caveat below.
+
+**The pre-hardening driver** read `P_BLOCKSIZE0+4n` and `P_BLOCKS0+4n` for all 8 units at attach
+(`z3660_geom_fill()`), folded a block size of 0 to 512 and trusted any nonzero block count — so
+it asked stock firmware to divide by zero on every boot, and a stale-fs unit (`0xFFFFFFFF`)
+would have been cached as a 4 G-block, 512-byte disk and **had real doorbells rung for it**
+(the negative control below proves it).
+
+**The guard** (`src/z3660.c` `z3660_geom_fill()` / `z3660_bs_ok()` / `z3660_geom_skip()`):
+read the block size FIRST; if it is not a power of two in 512..4096, skip the unit right there —
+`P_BLOCKS0+4n` is never read, so no firmware is ever asked to divide by it. A valid block size
+with 0 blocks is skipped the same way. A skipped unit gets the absent answer (bs 512, 0 blocks,
+pdt 0, not cached) — byte-identical to what the fork firmware's 0-block unit always produced, so
+**no behaviour change on the fork firmware** — and every data command to it is refused before a
+doorbell (the READ/WRITE guard also checks `valid`). Each skipped unit is named once per boot:
+`z3660: unit N: no drive mapped, skipped` (bs 0) or `... bad geometry (blocksize 0x.., blocks
+0x..), skipped`. Kernel `printf`, the driver's existing console path — no new undefined symbol.
+`z3660_skipmask` / `z3660_skip_msgs` are kmem-readable like the other diagnostics.
+
+Trip cost changes only on the absent path: attach is 8 BLOCKSIZE + 2 BLOCKS + 2 PDT + 3 DRVNUMX
+for the harness's 2-unit bus (was 8/8/8/9), and a command to an unmapped unit costs 2 trips (was
+5). Present units and the hot path are unchanged (READ 6, WRITE 5).
+
+**Evidence.** `make -C test/host check`: **131/131 gating, 6/6 parity** (was 95 gating; the
+attach and unmapped-unit gates re-pinned, new `test_stock_fw_bad_geometry()` + a whole-run
+`mock_div0 == 0` invariant). The mock now counts BLOCKS reads at block size 0 (`mock_div0`) and
+doorbells per unit, and `mock_set_geom()` injects raw unit answers (bs 0 with a stale-fs
+`0xFFFFFFFF`, 1000, 8192, 256, and 512 with 0 blocks). **Negative control:** the new tests run
+against the pre-change driver fail 25 checks, including doorbells rung for the bs-0/stale-fs unit.
+Cross-compiled (`m68k-cbm-sysv4-gcc -c -O -DSYSV -D_KERNEL -I.. -I../.. -I../inc z3660.c` in a
+copy of the staged `usr/sys/amiga/alien`): 8004 B, sha256 `85b042f6…659428ba`; `nm -u` still
+exactly `autocon bcopy printf sptalloc`.
+
+**Caveat (stock, not guarded):** a unit taken away by `piscsi_unmap_drive()` without a shutdown
+keeps its old block size and count with `fd == 0`; only `P_DRVTYPE` could tell. Every remap is
+bracketed by a 68k reset (see the cache note above), so this needs a firmware-side unmap-without-
+remap to bite. Metal on stock firmware is the open verification.

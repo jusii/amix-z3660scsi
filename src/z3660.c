@@ -880,7 +880,7 @@ char	**ap;
  * the same diagnostic convention as z3660_lastblock/z3660_blocks0 above.
  */
 struct z3660_unitgeom {
-	ulong	bs;		/* block size; the firmware's 0 already folded to 512 */
+	ulong	bs;		/* block size; 512 for a skipped/absent unit          */
 	ulong	nblocks;	/* total blocks; 0 == no drive mapped at this unit     */
 	ulong	pdt;		/* 0x00 direct-access disk, 0x05 read-only CD-ROM      */
 	ulong	valid;		/* nonzero == bs/nblocks/pdt are cached and usable     */
@@ -895,9 +895,65 @@ struct z3660_unitgeom	z3660_geom[Z3660_NUNITS];
 static struct z3660_unitgeom	z3660_geom_absent = { 512, 0, 0x00, 0 };
 
 /*
- * Read one unit's static geometry off the mailbox and latch it: four round trips,
- * paid once per unit at attach.  See ORDERING above for why the two per-unit
- * array reads must precede the P_DRVNUMX select and the P_PDT read.
+ * STOCK-FIRMWARE HARDENING (2026-09-26).  Amix must run on the stock Z3660
+ * firmware, which lacks the fork's piscsi_unit_blocks() guard (Z3660 c0510a7).
+ * In stock, a read of P_BLOCKS0+4n computes devs[n].fs / devs[n].block_size
+ * unguarded (scsi.c, handle_piscsi_read(), PISCSI_CMD_BLOCKS0..7), and
+ * block_size is 0 for every unit with no drive mapped: devs[] is BSS, only
+ * piscsi_map_drive() assigns it, and piscsi_shutdown() zeroes it again.  The
+ * 64-bit quotient then comes out of the EABI divide helper with a zero
+ * divisor: 0 while fs is still 0, but all-ones (0xFFFFFFFF on the wire) once
+ * a unit has been mapped and shut down, since shutdown clears block_size and
+ * leaves fs stale.  The pre-hardening fill read P_BLOCKS0 for all 8 units at
+ * attach, so it asked stock firmware to divide by zero on every boot.
+ *
+ * P_BLOCKSIZE0+4n, by contrast, is a plain devs[n].block_size load in EVERY
+ * firmware.  So it is read FIRST, and a unit whose block size is not a power
+ * of two in 512..4096 is skipped right there: P_BLOCKS0 is never read for it
+ * (no divide asked of any firmware), nothing is cached, it keeps the absent
+ * answer (bs 512, 0 blocks, pdt 0 -- byte-identical to what the fork firmware's
+ * 0-block unit always produced), and every data command to it is refused
+ * before a doorbell.  A valid block size with a 0 block count is skipped the
+ * same way.  Each skipped unit is named on the console once per boot.
+ */
+ulong	z3660_skipmask;		/* bit n: unit n was skipped (and reported)   */
+ulong	z3660_skip_msgs;	/* console lines emitted by the skip path     */
+
+/* the only block sizes a real piscsi unit reports: 512 (disk) .. 2048 (CD) */
+static int
+z3660_bs_ok( bs)
+ulong	bs;
+{
+	return bs >= 512 && bs <= 4096 && (bs & (bs - 1)) == 0;
+}
+
+static void
+z3660_geom_skip( unit, bs, nb)
+int	unit;
+ulong	bs, nb;
+{
+	/* the absent answer, field by field (no struct copy -> no memcpy ref) */
+	z3660_geom[unit].bs      = z3660_geom_absent.bs;	/* 512 */
+	z3660_geom[unit].nblocks = z3660_geom_absent.nblocks;	/* 0   */
+	z3660_geom[unit].pdt     = z3660_geom_absent.pdt;	/* disk */
+	z3660_geom[unit].valid   = 0;
+	if ((z3660_skipmask & (1UL << unit)) == 0) {
+		z3660_skipmask |= 1UL << unit;
+		z3660_skip_msgs++;
+		if (bs == 0)
+			printf( "z3660: unit %d: no drive mapped, skipped\n", unit);
+		else
+			printf( "z3660: unit %d: bad geometry (blocksize 0x%x, blocks 0x%x), skipped\n",
+				unit, (int)bs, (int)nb);
+	}
+}
+
+/*
+ * Read one unit's static geometry off the mailbox and latch it: four round trips
+ * for a present unit, paid once per unit at attach; ONE (the block size) for a
+ * skipped one.  See ORDERING above for why the two per-unit array reads must
+ * precede the P_DRVNUMX select and the P_PDT read, and STOCK-FIRMWARE HARDENING
+ * for why the block size is read, and judged, before the block count.
  */
 static void
 z3660_geom_fill( unit)
@@ -905,13 +961,21 @@ int	unit;
 {
 	ulong	bs, nb;
 
-	bs = RDLONG( P_BLOCKSIZE0 + unit * 4);
-	nb = RDLONG( P_BLOCKS0 + unit * 4);
+	bs = RDLONG( P_BLOCKSIZE0 + unit * 4);	/* no divide in any firmware */
+	if (!z3660_bs_ok( bs)) {
+		z3660_geom_skip( unit, bs, 0UL);
+		return;
+	}
+	nb = RDLONG( P_BLOCKS0 + unit * 4);	/* safe: block_size != 0 here */
+	if (nb == 0) {
+		z3660_geom_skip( unit, bs, nb);
+		return;
+	}
 	WRLONG( P_DRVNUMX, unit);
 	z3660_geom[unit].pdt     = RDLONG( P_PDT);
-	z3660_geom[unit].bs      = (bs == 0) ? 512 : bs;
+	z3660_geom[unit].bs      = bs;
 	z3660_geom[unit].nblocks = nb;
-	z3660_geom[unit].valid   = (nb != 0);	/* unmapped units stay re-readable */
+	z3660_geom[unit].valid   = 1;		/* unmapped units stay re-readable */
 }
 
 /*
@@ -1355,7 +1419,7 @@ struct sdcom	*cp;
 		z3660_blocks0 = nb;
 		/* nb == 0 means the firmware has no drive mapped at this unit --
 		 * it would silently no-op the I/O and we must NOT report GOOD. */
-		if (blocks == 0 || nb == 0 || (block + blocks) > nb) {
+		if (blocks == 0 || nb == 0 || !g->valid || (block + blocks) > nb) {
 			cp->status = 0xff; cp->okay = FALSE;
 			break;
 		}

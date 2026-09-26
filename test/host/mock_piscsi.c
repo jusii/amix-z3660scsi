@@ -108,6 +108,14 @@ void	(*fn)();
  * per-CDB cost, not a mock artifact.
  */
 unsigned long	mock_trips, mock_trips_rd, mock_trips_wr;
+/*
+ * Stock-firmware hazard counters (never reset by mock_trips_reset(); only
+ * mock_reset() zeroes them).  mock_div0: reads of BLOCKS0+4n while that unit's
+ * block_size is 0 -- the read on which STOCK firmware (no Z3660 c0510a7 guard)
+ * computes fs / 0.  mock_doorbells: READ/WRITE command triggers per unit.
+ */
+unsigned long	mock_div0;
+unsigned long	mock_doorbells[MOCK_UNITS];
 unsigned long	mock_trips_drvnumx, mock_trips_blocksize;
 unsigned long	mock_trips_blocks, mock_trips_pdt;
 
@@ -270,8 +278,12 @@ unsigned long	val;
 	switch (cmd) {
 	case R_DRVNUMX:	cur_drive = (int)val;			break;
 	case R_DRVNUM:	cur_drive = (val > 16) ? 255 : (int)val;break;
-	case R_READ:	do_read( val);				break;
-	case R_WRITE:	do_write( val);				break;
+	case R_READ:
+		if (val < MOCK_UNITS) mock_doorbells[val]++;
+		do_read( val);					break;
+	case R_WRITE:
+		if (val < MOCK_UNITS) mock_doorbells[val]++;
+		do_write( val);					break;
 	default:						break;
 	}
 }
@@ -291,6 +303,14 @@ unsigned int	cmd;
 	if (cmd >= R_BLOCKS0 && cmd < R_BLOCKS0 + MOCK_UNITS * 4) {
 		mock_trips_blocks++;
 		cur_drive = (int)((cmd - R_BLOCKS0) / 4);	/* firmware side effect */
+		/*
+		 * STOCK firmware computes fs / block_size here unguarded; with
+		 * block_size 0 that is the zero divide.  Count it, and return the
+		 * test-chosen stand-in for the helper's quotient (nblocks: 0 for a
+		 * never-mapped unit, 0xFFFFFFFF for a stale-fs one).
+		 */
+		if (devs[cur_drive].block_size == 0)
+			mock_div0++;
 		return devs[cur_drive].nblocks;
 	}
 	if (cmd >= R_READ_ADDR1 && cmd <= R_READ_ADDR4)
@@ -335,6 +355,8 @@ void mock_reset()
 	memset( u32_write, 0, sizeof u32_write);
 	used_dma = 0;
 	g_inflight_hook = 0;
+	mock_div0 = 0;
+	memset( mock_doorbells, 0, sizeof mock_doorbells);
 	mock_trips_reset();
 	mock_spl_reset();
 	if (!g_bounce)
@@ -393,4 +415,24 @@ int	unit;
 	if (unit < 0 || unit >= MOCK_UNITS)
 		return 0;
 	return devs[unit].backing_len;
+}
+
+/*
+ * Set a unit's raw mailbox answers without a backing store: what BLOCKSIZE0+4n,
+ * BLOCKS0+4n and PDT return for it.  Models a firmware unit table entry the
+ * driver must judge (e.g. stock's block_size 0 / garbage quotient).  The unit
+ * is NOT marked present, so a doorbell to it would find no backing.
+ */
+void mock_set_geom( unit, pdt, block_size, nblocks)
+int		unit;
+unsigned long	pdt, block_size, nblocks;
+{
+	mock_dev	*d;
+
+	if (unit < 0 || unit >= MOCK_UNITS)
+		return;
+	d = &devs[unit];
+	d->pdt        = pdt;
+	d->block_size = block_size;
+	d->nblocks    = nblocks;
 }
