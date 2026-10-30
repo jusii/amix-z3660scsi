@@ -1,3 +1,8 @@
+> **Moved.** This project now lives in [amigaux/amix](https://github.com/amigaux/amix) as
+> [`kernel/drivers/z3660scsi`](https://github.com/amigaux/amix/tree/master/kernel/drivers/z3660scsi), with its
+> history and later work (see `kernel/drivers/z3660scsi/docs/history-map.txt` there for the old-to-new commit
+> map). This repository is archived and no longer updated.
+
 # amix-z3660scsi — native Amix SCSI driver for the Z3660 accelerator
 
 A native Amix (Commodore SVR4, 68030/EMU) driver for the **Z3660** accelerator's
